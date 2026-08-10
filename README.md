@@ -1,28 +1,30 @@
 # Worktree Diet
 
-A local, read-only dashboard for measuring the disk weight of Git worktrees. It makes checked-out files and likely generated artifacts visible across linked branches without deleting anything.
+Worktree Diet is a local macOS-style utility for finding generated storage in Git worktrees across one or more locations. It measures both logical and allocated bytes, identifies inactive candidates with transparent evidence, and can recover space by moving scanned generated directories to Trash.
 
 ## Run
 
 ```sh
 bun install
-bun run start -- /path/to/repository
+bun run start -- /path/to/repositories /another/location
 ```
 
-The server binds only to `127.0.0.1`, opens the dashboard locally, and accepts no path through its HTTP API. Refreshing rescans the repository supplied at startup. Use `bun run start -- --help` for usage.
+Each argument can be a Git repository/worktree or a parent directory. Parent discovery is bounded to four levels, ignores symbolic links, `.git` internals, and recognised generated directories. The server binds only to `127.0.0.1` and opens a local browser utility.
 
-## What it measures
+## What it reports
 
-Worktree Diet reads `git worktree list --porcelain`, Git status, the most recent commit time, and file sizes underneath every returned worktree. It classifies file size into:
+- repositories and linked worktrees, deduplicated by Git common directory and canonical worktree path;
+- branch, Git clean/dirty state, last commit age, and a deliberately non-certain activity label;
+- logical and allocated bytes for dependencies, build output, caches, and source/other files;
+- outermost generated folders only: `node_modules`, Python environments, `dist`, `target`, `.next`, `.turbo`, and similar recognised directories.
 
-- dependencies: `node_modules`, Python environments, and vendor folders;
-- build output: `dist`, `target`, `.next`, and similar outputs;
-- caches: `.turbo`, `.cache`, `.vite`, and similar caches;
-- source / other: checked-out files not in those generated directories.
+Allocated size prefers filesystem block accounting (`stat.blocks * 512`). Files with the same device and inode are counted once per scan, avoiding inflated pnpm-style hardlink measurements. Symbolic links are never followed. Unreadable or moved paths are reported as scan notes.
 
-The generated figure is an **estimate of avoidable weight**, not a claim that bytes are identical across branches. Symbolic links are skipped; unreadable or vanishing paths become scan notes.
+## Move to Trash safety
 
-The dashboard can copy a safely quoted `rm -rf -- '…'` command for an observed generated directory. It never executes that command. Confirm a branch is inactive before you remove generated folders yourself.
+The only mutation is **Move generated folders to Trash**. The browser sends one selected worktree path plus a random per-process token in `x-worktree-diet-token`. The server derives the allowable generated directories from its latest report; it does not accept a browser-supplied path list.
+
+On macOS, folders move by rename into `~/.Trash/Worktree Diet/<unique-id>`. Nothing deletes worktrees, Git metadata, source files, or arbitrary paths. Cross-volume moves report an actionable error rather than copying and deleting. A fresh scan runs after every move; vanished folders become warnings while the rest can still move.
 
 ## Development
 
@@ -30,16 +32,10 @@ The dashboard can copy a safely quoted `rm -rf -- '…'` command for an observed
 bun test
 bun run typecheck
 bun run build
+bun run check
 ```
 
-The integration tests create real temporary Git repositories and linked worktrees. They use the production scanner to cover classification, dirty state, symlink safety, invalid inputs, and shell quoting.
-
-## Background
-
-- [Git worktree documentation](https://git-scm.com/docs/git-worktree)
-- [git-worktree.org FAQ](https://www.git-worktree.org/faq)
-- [Code Cleaner](https://code-cleaner.com/)
-- [agent-worktree](https://github.com/nekocode/agent-worktree)
+The integration tests use real temporary Git repositories, linked worktrees, filesystem hardlinks, and temporary Trash roots. They cover multi-root discovery and deduplication, allocated accounting, heuristic evidence, recoverable moves, and rejecting an unscanned worktree at the mutation boundary.
 
 ## License
 

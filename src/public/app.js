@@ -1,78 +1,47 @@
-const total = document.querySelector('#total');
-const generated = document.querySelector('#generated');
-const repository = document.querySelector('#repository');
-const status = document.querySelector('#scan-status');
-const worktrees = document.querySelector('#worktrees');
-const error = document.querySelector('#error');
-const errorMessage = document.querySelector('#error-message');
-const warnings = document.querySelector('#warnings');
-const warningList = document.querySelector('#warning-list');
-const empty = document.querySelector('#empty');
-const refresh = document.querySelector('#refresh');
-const template = document.querySelector('#worktree-template');
-let hasReport = false;
-
-const labels = { dependencies: 'Dependencies', buildOutput: 'Build output', caches: 'Caches', sourceOther: 'Source / other' };
+const $ = (selector, root = document) => root.querySelector(selector);
+const elements = { roots: $('#roots'), refresh: $('#refresh'), status: $('#scan-status'), reclaimable: $('#reclaimable'), inactive: $('#inactive-count'), review: $('#review-count'), scanTime: $('#scan-time'), notice: $('#notice'), error: $('#error'), loading: $('#loading'), list: $('#worktree-list'), empty: $('#empty'), count: $('#result-count'), inspector: $('#inspector'), warnings: $('#warnings'), warningList: $('#warning-list'), search: $('#search'), sort: $('#sort'), dialog: $('#confirm-dialog'), confirmDescription: $('#confirm-description'), confirmList: $('#confirm-list'), confirmMove: $('#confirm-move'), rowTemplate: $('#row-template') };
+const categoryLabels = { dependencies: 'Dependencies', buildOutput: 'Build output', caches: 'Caches', sourceOther: 'Source / other' };
+let report; let mutationToken; let selectedPath; let activeFilter = 'all'; let descending = true;
 const formatBytes = (bytes) => bytes < 1024 ? `${bytes} B` : bytes < 1024 ** 2 ? `${(bytes / 1024).toFixed(1)} KB` : bytes < 1024 ** 3 ? `${(bytes / 1024 ** 2).toFixed(1)} MB` : `${(bytes / 1024 ** 3).toFixed(2)} GB`;
-const commitAge = (time) => {
-  if (!time) return 'Commit time unavailable';
-  const hours = Math.max(0, Math.round((Date.now() - time) / 3_600_000));
-  return hours < 24 ? `${hours}h since commit` : `${Math.round(hours / 24)}d since commit`;
-};
-
-function text(element, value) { element.textContent = value; }
-function createBar(category, bytes, totalBytes) {
-  const item = document.createElement('div'); item.className = 'bar-row';
-  const label = document.createElement('span'); text(label, labels[category]);
-  const line = document.createElement('div'); line.className = `bar ${category}`;
-  const fill = document.createElement('i'); fill.style.width = `${totalBytes ? Math.max(1, bytes / totalBytes * 100) : 0}%`; line.append(fill);
-  const size = document.createElement('b'); text(size, formatBytes(bytes));
-  item.append(label, line, size); return item;
+const age = (time) => time === null ? 'Unknown' : `${Math.floor(Math.max(0, Date.now() - time) / 86_400_000)}d`;
+const repositoryName = (path) => path.split('/').filter(Boolean).at(-1) ?? path;
+function selected() { return report?.worktrees.find((record) => record.path === selectedPath); }
+function showNotice(message, kind = '') { elements.notice.textContent = message; elements.notice.className = `notice ${kind}`; elements.notice.hidden = !message; }
+function visibleRecords() {
+  const query = elements.search.value.trim().toLowerCase();
+  return (report?.worktrees ?? []).filter((record) => (activeFilter === 'all' || record.activity.state === activeFilter) && (!query || `${record.branch} ${record.repositoryPath} ${record.path}`.toLowerCase().includes(query))).sort((a, b) => (descending ? -1 : 1) * (a.generatedAllocatedBytes - b.generatedAllocatedBytes));
 }
-async function copyCleanup(button, path) {
-  const response = await fetch(`/api/cleanup-command?path=${encodeURIComponent(path)}`);
-  if (!response.ok) return;
-  const { command } = await response.json();
-  await navigator.clipboard.writeText(command);
-  const original = button.textContent; text(button, 'Copied');
-  window.setTimeout(() => text(button, original), 1400);
+function renderInspector(record) {
+  if (!record) { elements.inspector.innerHTML = '<p class="empty-state">Select a worktree to inspect its evidence.</p>'; return; }
+  const generated = record.generatedDirectories.map((directory) => `<li><code>${escapeHtml(directory.path)}</code><span>${formatBytes(directory.allocatedBytes)} allocated</span></li>`).join('') || '<li>No generated folders found.</li>';
+  const breakdown = Object.entries(categoryLabels).map(([category, label]) => `<tr><th>${label}</th><td>${formatBytes(record.sizes[category])} logical</td><td>${formatBytes(record.allocatedSizes[category])} allocated</td></tr>`).join('');
+  elements.inspector.innerHTML = `<div class="inspector-content"><header><p class="eyebrow">Selected worktree</p><h2 id="inspector-title">${escapeHtml(record.branch)}</h2><code>${escapeHtml(record.path)}</code></header><section><h3>Evidence: <span class="state ${record.activity.state}">${record.activity.state.replace('-', ' ')}</span></h3><ul>${record.activity.reasons.map((reason) => `<li>${escapeHtml(reason)}</li>`).join('')}</ul></section><section><h3>Measured storage</h3><p><strong>${formatBytes(record.generatedAllocatedBytes)}</strong> allocated generated · ${formatBytes(record.generatedBytes)} logical generated</p><table><thead><tr><th>Category</th><th>Logical</th><th>Allocated</th></tr></thead><tbody>${breakdown}</tbody></table></section><section><h3>Generated folders</h3><ul class="folder-list">${generated}</ul></section><button id="move-to-trash" class="primary move" type="button" ${record.generatedDirectories.length ? '' : 'disabled'}>Move generated folders to Trash</button></div>`;
+  $('#move-to-trash')?.addEventListener('click', openConfirmation);
 }
-function render(report) {
-  hasReport = true; error.hidden = true; empty.hidden = report.worktrees.length !== 0;
-  text(total, formatBytes(report.totalBytes)); text(generated, formatBytes(report.generatedBytes)); text(repository, report.repositoryPath);
-  worktrees.replaceChildren();
-  for (const record of report.worktrees) {
-    const node = template.content.firstElementChild.cloneNode(true);
-    text(node.querySelector('.branch'), record.branch); text(node.querySelector('.path'), record.path);
-    const state = node.querySelector('.state'); text(state, record.status); state.dataset.state = record.status;
-    text(node.querySelector('.age'), commitAge(record.lastCommitAt)); text(node.querySelector('.worktree-total strong'), formatBytes(record.totalBytes));
-    const bars = node.querySelector('.bars');
-    for (const category of Object.keys(labels)) bars.append(createBar(category, record.sizes[category], record.totalBytes));
-    const cleanup = node.querySelector('.cleanup');
-    if (record.generatedDirectories.length) {
-      const intro = document.createElement('p'); text(intro, 'Generated folders found. Verify this branch is inactive before cleanup.'); cleanup.append(intro);
-      for (const directory of record.generatedDirectories.slice(0, 3)) {
-        const row = document.createElement('div'); row.className = 'cleanup-row';
-        const name = document.createElement('span'); text(name, directory.name);
-        const copy = document.createElement('button'); copy.type = 'button'; text(copy, 'Copy cleanup command'); copy.addEventListener('click', () => copyCleanup(copy, directory.path));
-        row.append(name, copy); cleanup.append(row);
-      }
-    }
-    worktrees.append(node);
+function escapeHtml(value) { const element = document.createElement('span'); element.textContent = value; return element.innerHTML; }
+function renderList() {
+  const records = visibleRecords(); elements.list.replaceChildren(); elements.empty.hidden = records.length !== 0; elements.count.textContent = `${records.length} shown`;
+  for (const record of records) {
+    const row = elements.rowTemplate.content.firstElementChild.cloneNode(true); row.setAttribute('aria-selected', String(record.path === selectedPath));
+    $('.branch', row).textContent = record.branch; $('.repo', row).textContent = repositoryName(record.repositoryPath); $('.path', row).textContent = record.path; $('.evidence', row).innerHTML = `<span class="state ${record.activity.state}">${record.activity.state.replace('-', ' ')}</span>`; $('.age', row).textContent = age(record.lastCommitAt); $('.status', row).textContent = record.status; $('.status', row).dataset.status = record.status; $('.allocated', row).textContent = formatBytes(record.generatedAllocatedBytes);
+    row.addEventListener('click', () => { selectedPath = record.path; renderList(); renderInspector(record); }); elements.list.append(row);
   }
-  warningList.replaceChildren();
-  warnings.hidden = report.warnings.length === 0;
-  for (const warning of report.warnings) { const item = document.createElement('li'); text(item, `${warning.path}: ${warning.message}`); warningList.append(item); }
 }
-async function scan({ announce = true } = {}) {
-  refresh.disabled = true; status.dataset.state = 'scanning'; text(status, hasReport ? 'Refreshing — previous report remains visible' : 'Scanning worktrees…');
-  try {
-    const response = await fetch('/api/report'); const payload = await response.json();
-    if (!response.ok) throw new Error(payload.message);
-    render(payload.report); status.dataset.state = 'complete'; text(status, `Scanned ${payload.report.worktrees.length} worktree${payload.report.worktrees.length === 1 ? '' : 's'}`);
-  } catch (cause) {
-    error.hidden = false; text(errorMessage, cause instanceof Error ? cause.message : 'The scan failed.'); status.dataset.state = 'error'; text(status, 'Scan failed');
-  } finally { refresh.disabled = false; if (!announce) status.removeAttribute('aria-live'); }
+function render(nextReport) {
+  report = nextReport; selectedPath = report.worktrees.some((record) => record.path === selectedPath) ? selectedPath : report.worktrees[0]?.path;
+  const inactive = report.worktrees.filter((record) => record.activity.state === 'likely-inactive').length; const review = report.worktrees.filter((record) => record.activity.state === 'review').length;
+  elements.roots.textContent = report.roots.join(' · '); elements.reclaimable.textContent = formatBytes(report.generatedAllocatedBytes); elements.inactive.textContent = String(inactive); elements.review.textContent = String(review); elements.scanTime.textContent = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit', second: '2-digit' }).format(report.scannedAt); elements.loading.hidden = true;
+  elements.warningList.replaceChildren(); for (const warning of report.warnings) { const item = document.createElement('li'); item.textContent = `${warning.path}: ${warning.message}`; elements.warningList.append(item); } elements.warnings.hidden = report.warnings.length === 0; if (report.warnings.length) showNotice(`${report.warnings.length} scan note${report.warnings.length === 1 ? '' : 's'}: results may be partial.`, 'warning');
+  renderList(); renderInspector(selected());
 }
-refresh.addEventListener('click', () => scan());
-scan({ announce: false });
+async function scan() {
+  elements.refresh.disabled = true; elements.status.textContent = report ? 'Refreshing scan…' : 'Scanning worktrees…'; elements.error.hidden = true;
+  try { const response = await fetch('/api/report'); const payload = await response.json(); if (!response.ok) throw new Error(payload.message); mutationToken = payload.mutationToken; render(payload.report); elements.status.textContent = `Scanned ${payload.report.worktrees.length} worktree${payload.report.worktrees.length === 1 ? '' : 's'}`; }
+  catch (error) { elements.error.textContent = error instanceof Error ? error.message : 'The scan failed.'; elements.error.hidden = false; elements.status.textContent = 'Scan failed'; }
+  finally { elements.refresh.disabled = false; }
+}
+function openConfirmation() { const record = selected(); if (!record) return; elements.confirmDescription.textContent = `The following generated folders will be moved to ~/.Trash/Worktree Diet. Source files, Git metadata, and the worktree stay in place.`; elements.confirmList.replaceChildren(); for (const directory of record.generatedDirectories) { const item = document.createElement('li'); item.textContent = directory.path; elements.confirmList.append(item); } elements.confirmMove.textContent = `Move ${formatBytes(record.generatedAllocatedBytes)} to Trash`; elements.dialog.showModal(); }
+elements.dialog.addEventListener('close', async () => { if (elements.dialog.returnValue !== 'confirm') return; const record = selected(); if (!record || !mutationToken) return; elements.confirmMove.disabled = true; try { const response = await fetch('/api/move-to-trash', { method: 'POST', headers: { 'content-type': 'application/json', 'x-worktree-diet-token': mutationToken }, body: JSON.stringify({ worktreePath: record.path }) }); const payload = await response.json(); if (!response.ok) throw new Error(payload.message); mutationToken = payload.mutationToken; render(payload.report); const skipped = payload.result.warnings.length ? ` ${payload.result.warnings.length} folder(s) were skipped.` : ''; showNotice(`Moved ${payload.result.moved.length} generated folder(s) to Trash.${skipped}`, 'success'); } catch (error) { elements.error.textContent = error instanceof Error ? error.message : 'Unable to move folders to Trash.'; elements.error.hidden = false; } finally { elements.confirmMove.disabled = false; } });
+elements.refresh.addEventListener('click', scan); elements.search.addEventListener('input', renderList); elements.sort.addEventListener('click', () => { descending = !descending; elements.sort.textContent = `Allocated generated ${descending ? '↓' : '↑'}`; renderList(); });
+document.querySelectorAll('[data-filter]').forEach((button) => button.addEventListener('click', () => { activeFilter = button.dataset.filter; document.querySelectorAll('[data-filter]').forEach((candidate) => candidate.setAttribute('aria-pressed', String(candidate === button))); renderList(); }));
+scan();

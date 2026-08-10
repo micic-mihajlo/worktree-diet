@@ -1,7 +1,7 @@
 {
   "name": "worktree-diet",
-  "version": "0.1.0",
-  "description": "A read-only local dashboard for understanding Git worktree disk weight.",
+  "version": "0.2.0",
+  "description": "Find and recover generated disk space across Git worktrees.",
   "type": "module",
   "private": true,
   "license": "MIT",

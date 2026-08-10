@@ -1,0 +1,19 @@
+{
+  "name": "worktree-diet",
+  "version": "0.1.0",
+  "description": "A read-only local dashboard for understanding Git worktree disk weight.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "start": "bun run src/cli.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build src/cli.ts --target=bun --outdir=build",
+    "check": "bun run typecheck && bun test && bun run build"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "latest"
+  }
+}

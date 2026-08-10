@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Worktree Diet</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23297852'/%3E%3Cpath d='M18 25h28M32 17v30m0 0-10-10m10 10 10-10' stroke='white' stroke-width='5' fill='none'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <a class="skip-link" href="#results">Skip to results</a>
+  <header class="toolbar" aria-label="Application controls">
+    <div class="brand"><span class="mark" aria-hidden="true">↘</span><span>Worktree Diet</span></div>
+    <button class="refresh" id="refresh" type="button">Refresh scan</button>
+  </header>
+  <main id="results">
+    <section class="hero" aria-labelledby="page-title">
+      <p class="eyebrow">Local, read-only workspace audit</p>
+      <h1 id="page-title">Make the branch tax visible.</h1>
+      <div class="metric-grid" aria-live="polite">
+        <div class="metric"><span>Total checked-out weight</span><strong id="total">—</strong></div>
+        <div class="metric reclaim"><span>Estimated generated weight</span><strong id="generated">—</strong><small>Dependencies, build output, and caches. This is an estimate, not proof of duplicate bytes.</small></div>
+      </div>
+    </section>
+    <section class="report-head" aria-label="Scan information">
+      <div><h2>Worktrees</h2><p id="repository">Waiting to scan the startup repository.</p></div>
+      <p class="scan-status" id="scan-status" role="status">Idle</p>
+    </section>
+    <section id="empty" class="empty-state" hidden><h2>No linked worktrees found</h2><p>Git did not return worktrees for this repository.</p></section>
+    <section id="error" class="error-state" hidden><h2>Unable to scan</h2><p id="error-message"></p><p>Your last successful report remains visible when available.</p></section>
+    <section id="worktrees" class="worktree-list" aria-label="Worktree measurements"></section>
+    <section id="warnings" class="warnings" hidden aria-labelledby="warnings-title"><h2 id="warnings-title">Scan notes</h2><ul id="warning-list"></ul></section>
+    <p class="safety-note">Worktree Diet only reads Git metadata and file sizes. Commands are copied, never run. Verify a branch is inactive before removing generated folders.</p>
+  </main>
+  <template id="worktree-template">
+    <article class="worktree">
+      <header class="worktree-heading"><div><p class="branch"></p><p class="path"></p></div><div class="worktree-meta"><span class="state"></span><span class="age"></span></div></header>
+      <div class="worktree-total"><span>Total</span><strong></strong></div>
+      <div class="bars" aria-label="Category breakdown"></div>
+      <div class="cleanup"></div>
+    </article>
+  </template>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

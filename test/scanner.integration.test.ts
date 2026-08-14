@@ -29,8 +29,9 @@ describe("workspace scanner", () => {
   });
   test("discovers repositories from multiple parents and deduplicates shared worktrees", async () => {
     const parent = await mkdtemp(join(tmpdir(), "worktree-diet-parent-")); temporaryRoots.push(parent); const first = await makeRepository(parent); const second = await makeRepository(parent);
+    await mkdir(join(first.linked, "dist")); await writeFile(join(first.linked, "dist", "artifact.bin"), "generated");
     const report = await scanWorkspace([parent, first.root, second.linked]);
-    expect(report.repositories).toHaveLength(2); expect(report.worktrees).toHaveLength(4); expect(new Set(report.worktrees.map((worktree) => worktree.path)).size).toBe(4);
+    expect(report.repositories).toHaveLength(2); expect(report.worktrees).toHaveLength(4); expect(new Set(report.worktrees.map((worktree) => worktree.path)).size).toBe(4); expect(report.generatedBytes).toBe("generated".length);
   });
   test("prefers repositories inside a parent directory even when that parent sits in another repository", async () => {
     const outer = await mkdtemp(join(tmpdir(), "worktree-diet-outer-")); temporaryRoots.push(outer); await git(outer, "init"); const parent = join(outer, "repositories"); await mkdir(parent); const nested = await makeRepository(parent);

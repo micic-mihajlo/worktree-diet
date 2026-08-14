@@ -157,8 +157,9 @@ async function scanOneRepository(path: string, seenFiles: Set<string>): Promise<
   const repository = await repositoryIdentity(path); if (!repository) return undefined;
   const discovery = await runGit(["worktree", "list", "--porcelain"], path); if (!discovery.ok) return undefined;
   const worktrees = await Promise.all(parseWorktreeList(discovery.output).map(async (worktree) => ({ ...worktree, path: await realpath(worktree.path) })));
+  const displayRepository = { ...repository, path: worktrees[0]?.path ?? repository.path };
   const roots = new Set(worktrees.map((worktree) => worktree.path));
-  return { repository, worktrees: await Promise.all(worktrees.map((worktree) => inspectWorktree(worktree, repository, roots, seenFiles))) };
+  return { repository: displayRepository, worktrees: await Promise.all(worktrees.map((worktree) => inspectWorktree(worktree, displayRepository, roots, seenFiles))) };
 }
 async function discoverRepositoryPaths(inputPath: string): Promise<{ paths: string[]; warnings: ScanWarning[] }> {
   const requestedPath = resolve(inputPath); const warnings: ScanWarning[] = [];
@@ -184,7 +185,14 @@ export async function scanWorkspace(inputPaths: readonly string[]): Promise<Scan
   const roots: string[] = []; const discoveryWarnings: ScanWarning[] = []; const candidates = new Set<string>();
   for (const inputPath of inputPaths) { const discovery = await discoverRepositoryPaths(inputPath); roots.push(resolve(inputPath)); discoveryWarnings.push(...discovery.warnings); for (const path of discovery.paths) candidates.add(path); }
   const seenFiles = new Set<string>(); const repositories = new Map<string, { id: string; path: string }>(); const worktrees = new Map<string, WorktreeRecord>();
-  for (const candidate of candidates) { const scanned = await scanOneRepository(candidate, seenFiles); if (!scanned) continue; repositories.set(scanned.repository.id, scanned.repository); for (const worktree of scanned.worktrees) worktrees.set(worktree.path, worktree); }
+  for (const candidate of candidates) {
+    const repository = await repositoryIdentity(candidate);
+    if (!repository || repositories.has(repository.id)) continue;
+    const scanned = await scanOneRepository(candidate, seenFiles);
+    if (!scanned) continue;
+    repositories.set(scanned.repository.id, scanned.repository);
+    for (const worktree of scanned.worktrees) worktrees.set(worktree.path, worktree);
+  }
   const records = [...worktrees.values()].sort((left, right) => right.generatedAllocatedBytes - left.generatedAllocatedBytes || left.path.localeCompare(right.path));
   const totals = records.reduce((total, record) => addSizes(total, record.sizes), emptySizes()); const allocatedTotals = records.reduce((total, record) => addSizes(total, record.allocatedSizes), emptySizes());
   return { roots, repositories: [...repositories.values()], repositoryPath: [...repositories.values()][0]?.path ?? "", worktrees: records, totals, allocatedTotals, totalBytes: totalSizes(totals), allocatedBytes: totalSizes(allocatedTotals), generatedBytes: generatedTotal(totals), generatedAllocatedBytes: generatedTotal(allocatedTotals), warnings: [...discoveryWarnings, ...records.flatMap((record) => record.warnings)], scannedAt: Date.now() };

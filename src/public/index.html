@@ -18,22 +18,20 @@
       </header>
 
       <section class="storage-summary" aria-live="polite">
-        <span class="caption">Generated on disk</span>
-        <strong id="reclaimable">—</strong>
-        <span class="summary-copy">Dependencies, builds, and caches</span>
+        <span class="storage-mark" aria-hidden="true"><i></i></span>
+        <div><strong id="reclaimable">—</strong><span>generated files</span></div>
       </section>
 
       <nav class="filter-nav" aria-label="Filter worktrees">
-        <span class="nav-label">Worktrees</span>
-        <button type="button" data-filter="all" aria-pressed="true"><span>All</span><b id="all-count">—</b></button>
-        <button type="button" data-filter="likely-inactive" aria-pressed="false"><span>Likely inactive</span><b id="inactive-count">—</b></button>
-        <button type="button" data-filter="review" aria-pressed="false"><span>Needs review</span><b id="review-count">—</b></button>
-        <button type="button" data-filter="recent" aria-pressed="false"><span>Recent</span><b id="recent-count">—</b></button>
+        <button type="button" data-filter="all" aria-pressed="true"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M3.5 5.5h13v10h-13zM6 3.5h4l1.5 2"></path></svg><span>All worktrees</span><b id="all-count">—</b></button>
+        <button type="button" data-filter="likely-inactive" aria-pressed="false"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M10 4v6l4 2M10 17a7 7 0 1 0 0-14 7 7 0 0 0 0 14Z"></path></svg><span>Ready to clean</span><b id="inactive-count">—</b></button>
+        <button type="button" data-filter="review" aria-pressed="false"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M10 3.2 17 16H3L10 3.2Zm0 4v4M10 14v.1"></path></svg><span>Needs review</span><b id="review-count">—</b></button>
+        <button type="button" data-filter="recent" aria-pressed="false"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M4 4v4h4M4.5 8a6.5 6.5 0 1 1 .4 5.1"></path></svg><span>Recently active</span><b id="recent-count">—</b></button>
       </nav>
 
-      <section class="locations" aria-labelledby="locations-title">
-        <h2 id="locations-title" class="nav-label">Locations</h2>
-        <p id="roots">Awaiting scan</p>
+      <section class="locations" aria-label="Scan locations">
+        <svg aria-hidden="true" viewBox="0 0 20 20"><path d="M3 5.5h5l1.5 2H17v8H3z"></path></svg>
+        <div><strong>Scan locations</strong><p id="roots">Awaiting scan</p></div>
       </section>
 
       <footer class="sidebar-footer">
@@ -51,9 +49,12 @@
         <label class="search">
           <svg aria-hidden="true" viewBox="0 0 20 20"><circle cx="8.5" cy="8.5" r="5.5"></circle><path d="m13 13 4 4"></path></svg>
           <span class="sr-only">Search worktrees</span>
-          <input id="search" type="search" placeholder="Search" autocomplete="off" />
+          <input id="search" type="search" placeholder="Find a branch or repository" autocomplete="off" />
         </label>
-        <button id="refresh" class="icon-button" type="button" aria-label="Refresh scan">
+        <button id="sort" class="tool-button" type="button" aria-label="Sort by generated disk space descending">
+          <svg aria-hidden="true" viewBox="0 0 20 20"><path d="M6 4v12M3.5 13.5 6 16l2.5-2.5M11 6h6M11 10h4.5M11 14h3"></path></svg><span>Largest first</span>
+        </button>
+        <button id="refresh" class="icon-button" type="button" aria-label="Refresh scan" title="Refresh scan">
           <svg aria-hidden="true" viewBox="0 0 20 20"><path d="M15.6 6.2A7 7 0 1 0 17 12"></path><path d="M15.8 2.8v4h-4"></path></svg>
         </button>
       </header>
@@ -63,9 +64,9 @@
 
       <div class="content-split">
         <main class="list-pane">
-          <div class="table-head" aria-hidden="true">
-            <span>Branch</span><span>Evidence</span><span>Updated</span>
-            <button id="sort" type="button" aria-label="Sort by generated disk space descending">Generated ↓</button>
+          <div class="collection-bar">
+            <span id="collection-summary">Scanning worktrees…</span>
+            <span>Generated storage</span>
           </div>
           <div id="loading" class="empty-state"><span class="spinner" aria-hidden="true"></span>Scanning selected locations…</div>
           <div id="worktree-list" class="worktree-list" role="listbox" aria-label="Worktrees"></div>
@@ -102,10 +103,11 @@
 
   <template id="row-template">
     <button class="worktree-row" type="button" role="option">
+      <span class="repo-glyph" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M5.5 4.5a2 2 0 1 0 0 4 2 2 0 0 0 0-4ZM14.5 11.5a2 2 0 1 0 0 4 2 2 0 0 0 0-4ZM5.5 8.5v2.3a2.7 2.7 0 0 0 2.7 2.7h4.3M14.5 11.5V5.2M12.5 7.2l2-2 2 2"></path></svg></span>
       <span class="identity"><b class="branch"></b><small class="repo"></small><small class="path"></small></span>
       <span class="evidence"></span>
       <span class="age"></span>
-      <strong class="allocated"></strong>
+      <span class="storage-cell"><strong class="allocated"></strong><small>generated</small></span>
       <svg class="chevron" aria-hidden="true" viewBox="0 0 16 16"><path d="m6 3 5 5-5 5"></path></svg>
     </button>
   </template>

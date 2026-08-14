@@ -16,6 +16,7 @@ const elements = {
   list: $('#worktree-list'),
   empty: $('#empty'),
   count: $('#result-count'),
+  collectionSummary: $('#collection-summary'),
   inspector: $('#inspector'),
   warnings: $('#warnings'),
   warningList: $('#warning-list'),
@@ -53,6 +54,8 @@ const age = (time) => {
   if (days === 0) return 'Today';
   return `${days}d ago`;
 };
+
+const dateTime = (time) => time === null ? 'Unavailable' : new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(time);
 
 const repositoryName = (path) => path.split('/').filter(Boolean).at(-1) ?? path;
 const stateLabel = (state) => state === 'likely-inactive' ? 'Likely inactive' : state === 'review' ? 'Review' : 'Recent';
@@ -98,19 +101,20 @@ function renderInspector(record) {
   elements.inspector.innerHTML = `
     <div class="inspector-content">
       <header class="inspector-header">
-        <span class="caption">${escapeHtml(repositoryName(record.repositoryPath))}</span>
-        <h2 id="inspector-title">${escapeHtml(record.branch)}</h2>
-        <code>${escapeHtml(record.path)}</code>
+        <span class="inspector-glyph" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M5.5 4.5a2 2 0 1 0 0 4 2 2 0 0 0 0-4ZM14.5 11.5a2 2 0 1 0 0 4 2 2 0 0 0 0-4ZM5.5 8.5v2.3a2.7 2.7 0 0 0 2.7 2.7h4.3M14.5 11.5V5.2M12.5 7.2l2-2 2 2"></path></svg></span>
+        <div><h2 id="inspector-title">${escapeHtml(record.branch)}</h2><p>${escapeHtml(repositoryName(record.repositoryPath))}</p></div>
       </header>
       <section class="inspector-metric">
-        <span class="caption">Generated on disk</span>
         <strong>${formatBytes(record.generatedAllocatedBytes)}</strong>
-        <span>${formatBytes(record.generatedBytes)} logical size</span>
+        <span>generated storage · ${formatBytes(record.generatedBytes)} logical</span>
       </section>
-      <section class="evidence-card">
-        <header><span class="state ${record.activity.state}">${stateLabel(record.activity.state)}</span><span class="git-status ${record.status}">${record.status}</span></header>
-        <ul>${reasons}</ul>
-      </section>
+      <dl class="metadata-list">
+        <div><dt>Location</dt><dd><code>${escapeHtml(record.path)}</code></dd></div>
+        <div><dt>Last commit</dt><dd>${escapeHtml(dateTime(record.lastCommitAt))}</dd></div>
+        <div><dt>Working tree</dt><dd><span class="git-status ${record.status}">${escapeHtml(record.status)}</span></dd></div>
+        <div><dt>Recommendation</dt><dd><span class="state ${record.activity.state}">${stateLabel(record.activity.state)}</span></dd></div>
+      </dl>
+      <section class="evidence-card"><h3>Why this recommendation</h3><ul>${reasons}</ul></section>
       <section class="breakdown-section">
         <h3>Storage breakdown</h3>
         <ul class="breakdown">${breakdown}</ul>
@@ -140,6 +144,7 @@ function renderList() {
   elements.list.replaceChildren();
   elements.empty.hidden = records.length !== 0;
   elements.count.textContent = `${records.length} shown`;
+  elements.collectionSummary.textContent = `${records.length} ${records.length === 1 ? 'worktree' : 'worktrees'} · ${formatBytes(records.reduce((sum, record) => sum + record.generatedAllocatedBytes, 0))}`;
 
   for (const record of records) {
     const row = elements.rowTemplate.content.firstElementChild.cloneNode(true);
@@ -252,7 +257,7 @@ elements.refresh.addEventListener('click', scan);
 elements.search.addEventListener('input', renderList);
 elements.sort.addEventListener('click', () => {
   descending = !descending;
-  elements.sort.textContent = `Generated ${descending ? '↓' : '↑'}`;
+  $('span', elements.sort).textContent = descending ? 'Largest first' : 'Smallest first';
   elements.sort.setAttribute('aria-label', `Sort by generated disk space ${descending ? 'descending' : 'ascending'}`);
   renderList();
 });

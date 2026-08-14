@@ -2,8 +2,15 @@ import { join } from "node:path";
 import { moveGeneratedDirectories, scanWorkspace, type ScanReport } from "./scanner.ts";
 
 const publicDirectory = join(import.meta.dir, "public");
-const assets: Record<string, string> = { "/": "index.html", "/app.js": "app.js", "/styles.css": "styles.css" };
-const contentTypes: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8" };
+const assets: Record<string, string> = {
+  "/": "index.html",
+  "/app.js": "app.js",
+  "/styles.css": "styles.css",
+  "/fonts/IBMPlexSans-Variable.woff2": "fonts/IBMPlexSans-Variable.woff2",
+  "/fonts/IBMPlexMono-Regular.woff2": "fonts/IBMPlexMono-Regular.woff2",
+  "/fonts/LICENSE.txt": "fonts/LICENSE.txt",
+};
+const contentTypes: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".woff2": "font/woff2", ".txt": "text/plain; charset=utf-8" };
 export interface LocalServer { url: string; stop(): void; }
 export interface ServerOptions { port?: number; trashRoot?: string; }
 

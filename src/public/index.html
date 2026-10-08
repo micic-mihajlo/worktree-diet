@@ -5,92 +5,79 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="color-scheme" content="light dark" />
   <title>Worktree Diet</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230a84ff'/%3E%3Cpath d='M18 22h28M21 32h22M25 42h14' stroke='white' stroke-width='5' stroke-linecap='round'/%3E%3C/svg%3E" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%232563eb'/%3E%3Cpath d='M18 22h28M18 32h19M18 42h10' stroke='white' stroke-width='5.5' stroke-linecap='round'/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
   <a class="skip-link" href="#worktree-list">Skip to worktrees</a>
-  <div class="app-shell">
-    <aside class="sidebar" aria-label="Workspace summary and filters">
-      <header class="brand">
+  <div class="app">
+    <header class="titlebar">
+      <div class="brand">
         <span class="app-icon" aria-hidden="true"><i></i><i></i><i></i></span>
         <span>Worktree Diet</span>
-      </header>
-
-      <section class="storage-summary" aria-live="polite">
-        <span class="storage-mark" aria-hidden="true"><i></i></span>
-        <div><strong id="reclaimable">—</strong><span>generated files</span></div>
-      </section>
-
-      <nav class="filter-nav" aria-label="Filter worktrees">
-        <button type="button" data-filter="all" aria-pressed="true"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M3.5 5.5h13v10h-13zM6 3.5h4l1.5 2"></path></svg><span>All worktrees</span><b id="all-count">—</b></button>
-        <button type="button" data-filter="likely-inactive" aria-pressed="false"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M10 4v6l4 2M10 17a7 7 0 1 0 0-14 7 7 0 0 0 0 14Z"></path></svg><span>Ready to clean</span><b id="inactive-count">—</b></button>
-        <button type="button" data-filter="review" aria-pressed="false"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M10 3.2 17 16H3L10 3.2Zm0 4v4M10 14v.1"></path></svg><span>Needs review</span><b id="review-count">—</b></button>
-        <button type="button" data-filter="recent" aria-pressed="false"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M4 4v4h4M4.5 8a6.5 6.5 0 1 1 .4 5.1"></path></svg><span>Recently active</span><b id="recent-count">—</b></button>
-      </nav>
-
-      <section class="locations" aria-label="Scan locations">
-        <svg aria-hidden="true" viewBox="0 0 20 20"><path d="M3 5.5h5l1.5 2H17v8H3z"></path></svg>
-        <div><strong>Scan locations</strong><p id="roots">Awaiting scan</p></div>
-      </section>
-
-      <footer class="sidebar-footer">
+      </div>
+      <div class="scan-meta">
+        <span class="location" id="roots" title="">
+          <svg aria-hidden="true" viewBox="0 0 20 20"><path d="M3 5.5h5l1.5 2H17v8H3z"></path></svg><span>Awaiting scan</span>
+        </span>
         <span id="scan-status" role="status">Preparing scan</span>
-        <span id="scan-time">—</span>
-      </footer>
-    </aside>
-
-    <section class="workspace">
-      <header class="toolbar">
-        <div class="title-group">
-          <h1>Worktrees</h1>
-          <span id="result-count"></span>
-        </div>
-        <label class="search">
-          <svg aria-hidden="true" viewBox="0 0 20 20"><circle cx="8.5" cy="8.5" r="5.5"></circle><path d="m13 13 4 4"></path></svg>
-          <span class="sr-only">Search worktrees</span>
-          <input id="search" type="search" placeholder="Find a branch or repository" autocomplete="off" />
-        </label>
-        <button id="sort" class="tool-button" type="button" aria-label="Sort by generated disk space descending">
-          <svg aria-hidden="true" viewBox="0 0 20 20"><path d="M6 4v12M3.5 13.5 6 16l2.5-2.5M11 6h6M11 10h4.5M11 14h3"></path></svg><span>Largest first</span>
-        </button>
-        <button id="refresh" class="icon-button" type="button" aria-label="Refresh scan" title="Refresh scan">
+        <button id="refresh" class="icon-button" type="button" aria-label="Rescan" title="Rescan">
           <svg aria-hidden="true" viewBox="0 0 20 20"><path d="M15.6 6.2A7 7 0 1 0 17 12"></path><path d="M15.8 2.8v4h-4"></path></svg>
         </button>
-      </header>
-
-      <div id="notice" class="notice" hidden role="status"></div>
-      <div id="error" class="notice error" hidden role="alert"></div>
-
-      <div class="content-split">
-        <main class="list-pane">
-          <div class="collection-bar">
-            <span id="collection-summary">Scanning worktrees…</span>
-            <span>Generated storage</span>
-          </div>
-          <div id="loading" class="empty-state"><span class="spinner" aria-hidden="true"></span>Scanning selected locations…</div>
-          <div id="worktree-list" class="worktree-list" role="listbox" aria-label="Worktrees"></div>
-          <div id="empty" class="empty-state" hidden>No worktrees match this view.</div>
-        </main>
-
-        <aside id="inspector" class="inspector" aria-labelledby="inspector-title">
-          <div class="inspector-empty">
-            <span class="empty-icon" aria-hidden="true"></span>
-            <p>Select a worktree to inspect its storage.</p>
-          </div>
-        </aside>
       </div>
+    </header>
 
-      <section id="warnings" class="warnings" hidden>
-        <h2>Scan notes</h2>
-        <ul id="warning-list"></ul>
-      </section>
-    </section>
+    <div class="layout">
+      <main class="overview">
+        <section class="hero" aria-live="polite">
+          <span class="eyebrow">Ready to reclaim</span>
+          <p class="hero-number"><span id="ready-value">—</span><small id="ready-unit"></small></p>
+          <p id="hero-detail" class="hero-detail">Scanning your worktrees…</p>
+          <div id="status-bar" class="status-bar" role="img" aria-label="Generated storage by recommendation"></div>
+        </section>
+
+        <div class="controls">
+          <nav class="filters" aria-label="Filter worktrees">
+            <button type="button" data-filter="all" aria-pressed="true"><span>All</span><b id="all-size">—</b></button>
+            <button type="button" data-filter="likely-inactive" aria-pressed="false"><i class="dot likely-inactive" aria-hidden="true"></i><span>Ready to clean</span><b id="likely-inactive-size">—</b></button>
+            <button type="button" data-filter="review" aria-pressed="false"><i class="dot review" aria-hidden="true"></i><span>Needs review</span><b id="review-size">—</b></button>
+            <button type="button" data-filter="recent" aria-pressed="false"><i class="dot recent" aria-hidden="true"></i><span>Recently active</span><b id="recent-size">—</b></button>
+          </nav>
+          <label class="search">
+            <svg aria-hidden="true" viewBox="0 0 20 20"><circle cx="8.5" cy="8.5" r="5.5"></circle><path d="m13 13 4 4"></path></svg>
+            <span class="sr-only">Search worktrees</span>
+            <input id="search" type="search" placeholder="Search branches" autocomplete="off" />
+          </label>
+        </div>
+
+        <div id="notice" class="notice" hidden role="status"></div>
+        <div id="error" class="notice error" hidden role="alert"></div>
+
+        <div class="list-header">
+          <span id="result-count">Worktrees</span>
+          <span aria-hidden="true">Status</span>
+          <span aria-hidden="true">Last commit</span>
+          <button id="sort" type="button" aria-label="Sort by generated storage, largest first">Generated <svg aria-hidden="true" viewBox="0 0 16 16"><path d="M8 3.5v9M4.5 9 8 12.5 11.5 9"></path></svg></button>
+        </div>
+        <div id="loading" class="empty-state"><span class="spinner" aria-hidden="true"></span>Measuring generated folders…</div>
+        <div id="worktree-list" class="worktree-list" role="listbox" aria-label="Worktrees"></div>
+        <div id="empty" class="empty-state" hidden>No worktrees match this view.</div>
+
+        <section id="warnings" class="warnings" hidden>
+          <h2>Scan notes</h2>
+          <ul id="warning-list"></ul>
+        </section>
+      </main>
+
+      <aside id="inspector" class="inspector" aria-labelledby="inspector-title">
+        <p class="inspector-empty">Select a worktree to see what would move to Trash.</p>
+      </aside>
+    </div>
   </div>
 
   <dialog id="confirm-dialog" aria-labelledby="confirm-title">
     <form method="dialog">
-      <span class="dialog-icon" aria-hidden="true"></span>
+      <span class="dialog-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M4 6h12M8 6V4.5h4V6M5.5 6l.8 10h7.4l.8-10M8.5 9v4.5M11.5 9v4.5"></path></svg></span>
       <h2 id="confirm-title">Move generated folders to Trash?</h2>
       <p id="confirm-description"></p>
       <ul id="confirm-list"></ul>
@@ -103,12 +90,10 @@
 
   <template id="row-template">
     <button class="worktree-row" type="button" role="option">
-      <span class="repo-glyph" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M5.5 4.5a2 2 0 1 0 0 4 2 2 0 0 0 0-4ZM14.5 11.5a2 2 0 1 0 0 4 2 2 0 0 0 0-4ZM5.5 8.5v2.3a2.7 2.7 0 0 0 2.7 2.7h4.3M14.5 11.5V5.2M12.5 7.2l2-2 2 2"></path></svg></span>
-      <span class="identity"><b class="branch"></b><small class="repo"></small><small class="path"></small></span>
+      <span class="identity"><b class="branch"></b><small class="location-line"></small></span>
       <span class="evidence"></span>
       <span class="age"></span>
-      <span class="storage-cell"><strong class="allocated"></strong><small>generated</small></span>
-      <svg class="chevron" aria-hidden="true" viewBox="0 0 16 16"><path d="m6 3 5 5-5 5"></path></svg>
+      <span class="storage-cell"><span class="size-bar"><i></i></span><strong class="allocated"></strong></span>
     </button>
   </template>
   <script type="module" src="/app.js"></script>

@@ -36,6 +36,7 @@ let mutationToken;
 let selectedPath;
 let activeFilter = 'all';
 let descending = true;
+let ambiguousPaths = new Set();
 
 // Three significant figures reads better than fixed decimals: 512 MB, 4.98 GB, 14.2 GB.
 function byteParts(bytes) {
@@ -66,11 +67,23 @@ const baseName = (path) => path.split('/').filter(Boolean).at(-1) ?? path;
 const selected = () => report?.worktrees.find((record) => record.path === selectedPath);
 
 // "storefront · storefront-checkout-v2" — the folder only when it differs from the repository.
-function locationLine(record) {
+function shortLocation(record) {
   const repository = baseName(record.repositoryPath);
   const folder = baseName(record.path);
   return folder === repository ? repository : `${repository} · ${folder}`;
 }
+// Fall back to the full path when another worktree would read identically.
+const locationLine = (record) => ambiguousPaths.has(record.path) ? record.path : shortLocation(record);
+
+function findAmbiguousPaths(records) {
+  const key = (record) => `${record.branch}\n${shortLocation(record)}`;
+  const counts = new Map();
+  for (const record of records) counts.set(key(record), (counts.get(key(record)) ?? 0) + 1);
+  return new Set(records.filter((record) => counts.get(key(record)) > 1).map((record) => record.path));
+}
+
+// Nested generated folders can share a name (packages/web/dist, packages/docs/dist), so show where each lives.
+const folderLabel = (record, path) => path.startsWith(`${record.path}/`) ? path.slice(record.path.length + 1) : baseName(path);
 
 function escapeHtml(value) {
   const element = document.createElement('span');
@@ -97,7 +110,12 @@ function verdict(record) {
   const days = record.lastCommitAt === null ? null : daysSince(record.lastCommitAt);
   if (record.activity.state === 'likely-inactive') return `Clean, and nobody has committed here in ${days} days. Its generated folders are safe to move — reinstall if you come back.`;
   if (record.status === 'dirty') return 'Has uncommitted changes. Moving generated folders won’t touch them, but you may still be working here.';
-  if (record.activity.state === 'review') return 'Not touched this week, but not idle long enough to call inactive. Worth a quick look first.';
+  if (record.activity.state === 'review') {
+    if (days === null) return 'Couldn’t read the last commit time, so there’s no evidence either way. Check it before cleaning.';
+    if (record.generatedAllocatedBytes === 0) return 'Nothing generated here to reclaim.';
+    if (record.status !== 'clean') return 'Couldn’t read Git status, so uncommitted work can’t be ruled out. Check it before cleaning.';
+    return `Last commit was ${days} days ago — past this week, but not idle long enough to call inactive. Worth a quick look first.`;
+  }
   return 'Committed to this week — expect to reinstall dependencies if you clean it.';
 }
 
@@ -142,7 +160,7 @@ function renderInspector(record) {
     .toSorted((left, right) => right.allocatedBytes - left.allocatedBytes)
     .map((directory) => `
       <li title="${escapeHtml(directory.path)}">
-        <code>${escapeHtml(directory.name)}</code><small>${categoryLabels[directory.category]}</small><span>${formatBytes(directory.allocatedBytes)}</span>
+        <code>${escapeHtml(folderLabel(record, directory.path))}</code><small>${categoryLabels[directory.category]}</small><span>${formatBytes(directory.allocatedBytes)}</span>
         ${record.generatedDirectories.length > 1 ? `<i class="folder-bar" style="width:${Math.max(1, directory.allocatedBytes / largestFolder * 100)}%"></i>` : ''}
       </li>`).join('') || '<li class="empty-folder">No generated folders found.</li>';
 
@@ -198,6 +216,7 @@ function renderList() {
     row.classList.add(record.activity.state);
     $('.branch', row).textContent = record.branch;
     $('.location-line', row).textContent = locationLine(record);
+    row.title = record.path;
     $('.evidence', row).innerHTML = `<span class="state ${record.activity.state}">${stateLabels[record.activity.state]}</span>`;
     $('.age', row).textContent = age(record.lastCommitAt);
     $('.allocated', row).textContent = formatBytes(record.generatedAllocatedBytes);
@@ -214,6 +233,7 @@ function renderRoots() {
 
 function render(nextReport) {
   report = nextReport;
+  ambiguousPaths = findAmbiguousPaths(report.worktrees);
   selectedPath = report.worktrees.some((record) => record.path === selectedPath) ? selectedPath : visibleRecords()[0]?.path;
   elements.loading.hidden = true;
   renderRoots();
@@ -262,7 +282,7 @@ function openConfirmation() {
   elements.confirmList.replaceChildren();
   for (const directory of record.generatedDirectories) {
     const item = document.createElement('li');
-    item.innerHTML = `<code>${escapeHtml(directory.name)}</code><span>${formatBytes(directory.allocatedBytes)}</span>`;
+    item.innerHTML = `<code>${escapeHtml(folderLabel(record, directory.path))}</code><span>${formatBytes(directory.allocatedBytes)}</span>`;
     elements.confirmList.append(item);
   }
   elements.confirmMove.textContent = `Move ${formatBytes(record.generatedAllocatedBytes)} to Trash`;
@@ -285,8 +305,11 @@ elements.dialog.addEventListener('close', async () => {
     if (!response.ok) throw new Error(payload.message);
     mutationToken = payload.mutationToken;
     render(payload.report);
-    const skipped = payload.result.warnings.length ? ` ${plural(payload.result.warnings.length, 'folder')} skipped.` : '';
-    showNotice(`Moved ${formatBytes(record.generatedAllocatedBytes)} from ${record.branch} to Trash.${skipped}`, 'success');
+    // Report what the server actually moved — scanned sizes describe intent, not outcome.
+    const { moved, warnings } = payload.result;
+    const skipped = warnings.length ? ` Skipped ${warnings.map((warning) => `${folderLabel(record, warning.path)} (${warning.message})`).join(', ')}.` : '';
+    if (moved.length === 0) showNotice(`Nothing moved from ${record.branch}.${skipped}`, 'warning');
+    else showNotice(`Moved ${plural(moved.length, 'folder')} from ${record.branch} to Trash.${skipped}`, warnings.length ? 'warning' : 'success');
   } catch (error) {
     elements.error.textContent = error instanceof Error ? error.message : 'Unable to move folders to Trash.';
     elements.error.hidden = false;

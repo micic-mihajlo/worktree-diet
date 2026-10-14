@@ -7,8 +7,10 @@ const elements = {
   readyValue: $('#ready-value'),
   readyUnit: $('#ready-unit'),
   heroDetail: $('#hero-detail'),
-  statusBar: $('#status-bar'),
-  allSize: $('#all-size'),
+  hero: $('.hero'),
+  meter: $('#meter'),
+  meterLabels: $('#meter-labels'),
+  allCount: $('#all-count'),
   notice: $('#notice'),
   error: $('#error'),
   loading: $('#loading'),
@@ -37,6 +39,29 @@ let selectedPath;
 let activeFilter = 'all';
 let descending = true;
 let ambiguousPaths = new Set();
+
+const reducedMotion = matchMedia('(prefers-reduced-motion: reduce)');
+
+// Meter geometry: must match --cell and --gap on .hero in styles.css.
+const CELL_GAP = 3;
+const CELL_PITCH = 10 + CELL_GAP;
+const meterLayers = ['likely-inactive', 'review', 'recent', 'freed'];
+const meterWords = { 'likely-inactive': 'ready', review: 'review', recent: 'recent', freed: 'freed' };
+const meter = {
+  columns: 0,
+  scale: 0, // largest total seen this session, so space you free shows up as freed cells
+  ends: null, // cumulative column end per layer, as last drawn
+  revealed: false,
+  labels: Object.fromEntries(meterLayers.map((layer) => {
+    const label = document.createElement('span');
+    label.className = 'meter-label';
+    elements.meterLabels.append(label);
+    return [layer, label];
+  })),
+};
+let shownReadyBytes = null;
+let readyAnimation = 0;
+let introPending = true;
 
 // Three significant figures reads better than fixed decimals: 512 MB, 4.98 GB, 14.2 GB.
 function byteParts(bytes) {
@@ -130,23 +155,139 @@ function visibleRecords() {
 function renderHero() {
   const totals = stateTotals();
   const ready = totals['likely-inactive'];
-  const [value, unit] = byteParts(ready.bytes);
-  elements.readyValue.textContent = value;
-  elements.readyUnit.textContent = unit;
   elements.heroDetail.innerHTML = ready.count
     ? `sitting in <strong>${plural(ready.count, 'worktree')}</strong> that look abandoned, out of ${formatBytes(report.generatedAllocatedBytes)} of generated files across ${plural(report.worktrees.length, 'worktree')}.`
     : `Nothing looks abandoned yet — ${formatBytes(report.generatedAllocatedBytes)} generated across ${plural(report.worktrees.length, 'worktree')}.`;
+  elements.allCount.textContent = String(report.worktrees.length);
+  for (const state of states) $(`#${state}-count`).textContent = String(totals[state].count);
 
-  const whole = Math.max(1, report.generatedAllocatedBytes);
-  elements.statusBar.innerHTML = states
-    .filter((state) => totals[state].bytes > 0)
-    .map((state) => `<i class="${state}" style="flex-grow:${totals[state].bytes / whole}" title="${stateLabels[state]}: ${formatBytes(totals[state].bytes)}"></i>`)
-    .join('');
-  elements.statusBar.setAttribute('aria-label', states.map((state) => `${stateLabels[state]} ${formatBytes(totals[state].bytes)}`).join(', '));
-
-  elements.allSize.textContent = formatBytes(report.generatedAllocatedBytes);
-  for (const state of states) $(`#${state}-size`).textContent = formatBytes(totals[state].bytes);
+  meter.scale = Math.max(meter.scale, report.generatedAllocatedBytes);
+  const bytes = { ...Object.fromEntries(states.map((state) => [state, totals[state].bytes])), freed: meter.scale - report.generatedAllocatedBytes };
+  elements.meter.setAttribute('aria-label', meterLayers.filter((layer) => bytes[layer] > 0).map((layer) => `${formatBytes(bytes[layer])} ${meterWords[layer]}`).join(', '));
+  drawMeter(bytes, ready.bytes);
 }
+
+// Whole cells per layer (largest remainder), with at least one cell for anything non-zero.
+function apportionCells(values, cells) {
+  const total = values.reduce((sum, value) => sum + value, 0);
+  if (!total || !cells) return values.map(() => 0);
+  const exact = values.map((value) => value / total * cells);
+  const counts = exact.map(Math.floor);
+  const order = exact.map((value, index) => [value - Math.floor(value), index]).sort((left, right) => right[0] - left[0]);
+  for (let remaining = cells - counts.reduce((sum, count) => sum + count, 0), index = 0; remaining > 0; remaining -= 1, index += 1) counts[order[index % order.length][1]] += 1;
+  for (const [index, value] of values.entries()) {
+    if (value <= 0 || counts[index] > 0) continue;
+    const donor = counts.indexOf(Math.max(...counts));
+    if (counts[donor] > 1) { counts[donor] -= 1; counts[index] = 1; }
+  }
+  return counts;
+}
+
+// Each layer spans from the meter's left edge to its cumulative end and is scaled, never resized, so
+// every change is a compositor-only transform. Stepping by whole cells keeps the motion pixel-true.
+function drawMeter(bytes, readyBytes) {
+  if (!meter.columns) return;
+  const counts = apportionCells(meterLayers.map((layer) => bytes[layer]), meter.columns);
+  const width = meter.columns * CELL_PITCH;
+  const ends = {}; let end = 0;
+  meterLayers.forEach((layer, index) => { end += counts[index]; ends[layer] = end; });
+  const intro = introPending && !reducedMotion.matches;
+  const moved = meter.ends ? Math.max(...meterLayers.map((layer) => Math.abs(ends[layer] - meter.ends[layer]))) : 0;
+  const duration = intro || moved === 0 ? 0 : Math.min(1200, Math.max(450, moved * 45));
+  elements.hero.style.setProperty('--duration', `${duration}ms`);
+
+  for (const layer of meterLayers) {
+    const element = $(`.layer.${layer}`, elements.meter);
+    element.style.setProperty('--steps', String(Math.max(1, Math.abs(ends[layer] - (meter.ends?.[layer] ?? 0)))));
+    element.style.transform = `scaleX(${ends[layer] ? (ends[layer] * CELL_PITCH - CELL_GAP / 2) / width : 0})`;
+  }
+  meter.ends = ends;
+  // The legend changes in one step once the cells finish moving, so it never runs ahead of the meter
+  // or reflows the page mid-animation.
+  clearTimeout(meter.labelTimer);
+  if (duration && meter.labelsDrawn) meter.labelTimer = setTimeout(() => drawLabels(bytes, counts, ends, false), duration);
+  else drawLabels(bytes, counts, ends, intro);
+
+  if (intro) {
+    introPending = false;
+    // Reveal cell by cell, and count the hero up while the "ready" cells light up.
+    const sweep = 1100;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      elements.hero.style.setProperty('--sweep', `${sweep}ms`);
+      elements.hero.classList.add('is-revealed');
+      // Labels fade in as the sweep reaches their segment; afterwards they respond immediately.
+      setTimeout(() => { for (const label of Object.values(meter.labels)) label.style.removeProperty('--reveal-delay'); }, sweep);
+    }));
+    animateReady(0, readyBytes, Math.max(350, sweep * ends['likely-inactive'] / meter.columns));
+  } else {
+    if (introPending) { introPending = false; elements.hero.classList.add('is-revealed'); }
+    animateReady(shownReadyBytes ?? readyBytes, readyBytes, duration);
+  }
+}
+
+// Labels flow left to right, each at least as wide as its segment, so a label that fits sits under its
+// segment and one that doesn't pushes the rest along (wrapping if needed) instead of being hidden.
+function drawLabels(bytes, counts, ends, intro) {
+  const last = meterLayers.findLast((layer) => bytes[layer] > 0);
+  for (const [index, layer] of meterLayers.entries()) {
+    const label = meter.labels[layer];
+    label.innerHTML = `<i class="dot ${layer}"></i><b>${formatBytes(bytes[layer])}</b> ${meterWords[layer]}`;
+    label.style.width = `${counts[index] * CELL_PITCH}px`;
+    if (intro) label.style.setProperty('--reveal-delay', `${Math.round(1100 * (ends[layer] - counts[index]) / meter.columns)}ms`);
+    label.classList.toggle('is-empty', bytes[layer] <= 0);
+    label.classList.toggle('is-last', layer === last);
+  }
+  meter.labelsDrawn = true;
+}
+
+function setReady(bytes) {
+  const [value, unit] = byteParts(bytes);
+  elements.readyValue.textContent = value;
+  elements.readyUnit.textContent = unit;
+  elements.readyValue.style.width = '';
+  elements.readyValue.classList.remove('is-counting');
+  shownReadyBytes = bytes;
+}
+
+// Counts in the larger value's unit so the unit never flickers. While counting, the digits sit in a
+// box sized once to the widest string, on their own layer, so ticking never reflows or repaints the page.
+function animateReady(from, to, duration) {
+  cancelAnimationFrame(readyAnimation);
+  if (from === to || !duration || reducedMotion.matches) { setReady(to); return; }
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const [largest, unit] = byteParts(Math.max(from, to));
+  const divisor = 1024 ** units.indexOf(unit);
+  const digits = largest.includes('.') ? largest.split('.')[1].length : 0;
+  const text = (bytes) => (bytes / divisor).toFixed(digits);
+  // Start on the next frame: measuring now would force a layout in the middle of rendering.
+  readyAnimation = requestAnimationFrame((startedAt) => {
+    elements.readyUnit.textContent = unit;
+    elements.readyValue.style.width = '';
+    elements.readyValue.textContent = text(Math.max(from, to));
+    elements.readyValue.style.width = `${elements.readyValue.getBoundingClientRect().width}px`;
+    elements.readyValue.classList.add('is-counting');
+    let last = '';
+    const tick = (now) => {
+      const progress = Math.min(1, (now - startedAt) / duration);
+      if (progress === 1) { setReady(to); return; }
+      const next = text(from + (to - from) * progress);
+      if (next !== last) { elements.readyValue.textContent = next; last = next; }
+      readyAnimation = requestAnimationFrame(tick);
+    };
+    tick(startedAt);
+  });
+}
+
+new ResizeObserver(([entry]) => {
+  const columns = Math.floor((entry.contentRect.width + CELL_GAP) / CELL_PITCH);
+  if (columns === meter.columns) return;
+  meter.columns = columns;
+  meter.ends = null;
+  elements.hero.style.setProperty('--columns', String(columns));
+  elements.hero.classList.add('is-instant');
+  if (report) renderHero();
+  requestAnimationFrame(() => elements.hero.classList.remove('is-instant'));
+}).observe(elements.hero);
 
 function renderInspector(record) {
   if (!record) {
@@ -189,40 +330,63 @@ function renderInspector(record) {
     </div>
     <footer class="inspector-action">
       <button id="move-to-trash" class="primary" type="button" ${record.generatedDirectories.length ? '' : 'disabled'}>
-        Move ${formatBytes(record.generatedAllocatedBytes)} to Trash
+        ${record.generatedDirectories.length ? `Move ${formatBytes(record.generatedAllocatedBytes)} to Trash` : 'Nothing to move'}
       </button>
       <p>Source, branches and history stay put. Restore anytime from Trash.</p>
     </footer>`;
   $('#move-to-trash')?.addEventListener('click', openConfirmation);
 }
 
-function selectRecord(record, row) {
+// Rows are built once per report and reused, so search, filters and sorting only reorder nodes.
+let rows = new Map();
+const recordsByRow = new WeakMap();
+
+function buildRow(record, largest) {
+  const row = elements.rowTemplate.content.firstElementChild.cloneNode(true);
+  const [identity, evidence, ageCell, storage] = row.children;
+  row.classList.add(record.activity.state);
+  row.title = record.path;
+  row.setAttribute('aria-selected', String(record.path === selectedPath));
+  identity.firstElementChild.textContent = record.branch;
+  identity.lastElementChild.textContent = locationLine(record);
+  const state = document.createElement('span');
+  state.className = `state ${record.activity.state}`;
+  state.textContent = stateLabels[record.activity.state];
+  evidence.append(state);
+  ageCell.textContent = age(record.lastCommitAt);
+  // Bars share one scale across the whole report so filtering never rescales them.
+  storage.firstElementChild.firstElementChild.style.setProperty('--fraction', String(Math.max(0.005, record.generatedAllocatedBytes / largest)));
+  storage.lastElementChild.textContent = formatBytes(record.generatedAllocatedBytes);
+  recordsByRow.set(row, record);
+  return row;
+}
+
+function buildRows() {
+  const largest = Math.max(1, ...report.worktrees.map((record) => record.generatedAllocatedBytes));
+  rows = new Map(report.worktrees.map((record) => [record.path, buildRow(record, largest)]));
+}
+
+function selectRecord(record) {
+  rows.get(selectedPath)?.setAttribute('aria-selected', 'false');
   selectedPath = record.path;
-  elements.list.querySelectorAll('.worktree-row').forEach((candidate) => candidate.setAttribute('aria-selected', String(candidate === row)));
+  rows.get(selectedPath)?.setAttribute('aria-selected', 'true');
   renderInspector(record);
 }
 
 function renderList() {
   const records = visibleRecords();
-  elements.list.replaceChildren();
+  elements.list.replaceChildren(...records.map((record) => rows.get(record.path)));
   elements.empty.hidden = records.length !== 0;
   elements.count.textContent = plural(records.length, 'worktree');
+  if (elements.list.classList.contains('is-intro')) stepRowBars();
+}
 
-  // Bars share one scale across the whole report so filtering never rescales them.
-  const largest = Math.max(1, ...report.worktrees.map((record) => record.generatedAllocatedBytes));
-  for (const record of records) {
-    const row = elements.rowTemplate.content.firstElementChild.cloneNode(true);
-    row.setAttribute('aria-selected', String(record.path === selectedPath));
-    row.classList.add(record.activity.state);
-    $('.branch', row).textContent = record.branch;
-    $('.location-line', row).textContent = locationLine(record);
-    row.title = record.path;
-    $('.evidence', row).innerHTML = `<span class="state ${record.activity.state}">${stateLabels[record.activity.state]}</span>`;
-    $('.age', row).textContent = age(record.lastCommitAt);
-    $('.allocated', row).textContent = formatBytes(record.generatedAllocatedBytes);
-    $('.size-bar i', row).style.width = `${Math.max(1, record.generatedAllocatedBytes / largest * 100)}%`;
-    row.addEventListener('click', () => selectRecord(record, row));
-    elements.list.append(row);
+// First paint only: bars on the first screen of rows grow in, one cell (8px) per step.
+function stepRowBars() {
+  const track = $('.size-bar', elements.list)?.clientWidth ?? 0;
+  for (const [index, bar] of [...elements.list.querySelectorAll('.size-bar i')].slice(0, 14).entries()) {
+    bar.style.setProperty('--cells', String(Math.max(1, Math.ceil(Number(bar.style.getPropertyValue('--fraction')) * track / 8))));
+    bar.style.setProperty('--i', String(index));
   }
 }
 
@@ -232,6 +396,7 @@ function renderRoots() {
 }
 
 function render(nextReport) {
+  const firstPaint = introPending && !reducedMotion.matches;
   report = nextReport;
   ambiguousPaths = findAmbiguousPaths(report.worktrees);
   selectedPath = report.worktrees.some((record) => record.path === selectedPath) ? selectedPath : visibleRecords()[0]?.path;
@@ -249,6 +414,11 @@ function render(nextReport) {
   if (report.warnings.length) showNotice(`${plural(report.warnings.length, 'scan note')} — results may be partial.`, 'warning');
   else if (elements.notice.classList.contains('warning')) showNotice('');
 
+  buildRows();
+  if (firstPaint) {
+    elements.list.classList.add('is-intro');
+    setTimeout(() => elements.list.classList.remove('is-intro'), 1800);
+  }
   renderList();
   renderInspector(selected());
 }
@@ -319,12 +489,20 @@ elements.dialog.addEventListener('close', async () => {
 });
 
 elements.refresh.addEventListener('click', scan);
-elements.search.addEventListener('input', renderList);
+let searchFrame = 0;
+elements.search.addEventListener('input', () => {
+  cancelAnimationFrame(searchFrame);
+  searchFrame = requestAnimationFrame(renderList);
+});
 elements.sort.addEventListener('click', () => {
   descending = !descending;
   elements.sort.classList.toggle('ascending', !descending);
   elements.sort.setAttribute('aria-label', `Sort by generated storage, ${descending ? 'largest' : 'smallest'} first`);
   renderList();
+});
+elements.list.addEventListener('click', (event) => {
+  const row = event.target.closest('.worktree-row');
+  if (row) selectRecord(recordsByRow.get(row));
 });
 elements.list.addEventListener('keydown', (event) => {
   if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;

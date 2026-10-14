@@ -9,6 +9,14 @@ bun install
 bun run start -- /path/to/repositories /another/location
 ```
 
+To try it without scanning anything — or to take screenshots without exposing your own paths — run the demo workspace:
+
+```sh
+bun run start -- --demo
+```
+
+Demo mode serves a realistic sample workspace from memory. Moving folders to Trash is simulated; nothing on disk is read or touched.
+
 Each argument can be a Git repository/worktree or a parent directory. Parent discovery is bounded to four levels, ignores symbolic links, `.git` internals, and recognised generated directories. The server binds only to `127.0.0.1` and opens a local browser utility.
 
 ## What it reports

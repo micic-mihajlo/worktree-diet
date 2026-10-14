@@ -32,7 +32,7 @@ Allocated size prefers filesystem block accounting (`stat.blocks * 512`). A file
 
 ## Move to Trash safety
 
-The only mutation is **Move generated folders to Trash**. The browser sends one selected worktree path plus a random per-process token in `x-worktree-diet-token`. The server derives the allowable generated directories from its latest report; it does not accept a browser-supplied path list. API requests must address the server by its own host (`127.0.0.1` or `localhost` and its port), which blocks DNS-rebinding pages from reaching it.
+The only mutation is **Move generated folders to Trash**. The browser sends one selected worktree path, the folders its confirmation dialog listed, and a random per-process token in `x-worktree-diet-token`. The server moves only folders that are both confirmed and in its own latest scan of that worktree, so it never moves a path it didn't find itself, and never moves a folder that appeared after you confirmed. A generated-looking folder that contains another worktree (say, a worktree checked out under `build/`) is treated as source and never offered. API requests must address the server by its own host (`127.0.0.1` or `localhost` and its port), which blocks DNS-rebinding pages from reaching it.
 
 On macOS, folders move by rename into `~/.Trash/Worktree Diet/<unique-id>`. Nothing deletes worktrees, Git metadata, source files, or arbitrary paths. Before each move the folder is re-checked: still a real directory, still inside the worktree, and still at the canonical path the scan saw, so a parent swapped for a symlink since the scan can't redirect it. Cross-volume moves are skipped with an explanation rather than copying and deleting. A fresh scan runs after every move; vanished folders become warnings while the rest can still move.
 
@@ -55,7 +55,7 @@ bun run smoke    # runs that executable from another directory and checks the pa
 | `src/demo.ts` | The in-memory demo workspace |
 | `src/public/` | The browser app: `main.ts` wires `meter`, `list` and `inspector`; `format` and `model` are pure and unit tested |
 
-The scanner and server tests use real temporary Git repositories, linked worktrees, hardlinks and temporary Trash roots. They cover discovery and deduplication, stale worktrees, deterministic hardlink accounting, every activity cause, the move's safety checks, the Host check and scan sharing. The frontend's formatting and view logic have unit tests of their own.
+The scanner and server tests use real temporary Git repositories, linked worktrees, hardlinks and temporary Trash roots. They cover discovery and deduplication, stale and nested worktrees, deterministic hardlink accounting, every activity cause, the move's safety checks, the Host check, and scan sharing and move races (with controlled timing). The frontend's formatting and view logic have unit tests, and the worktree list has DOM tests.
 
 ## License
 

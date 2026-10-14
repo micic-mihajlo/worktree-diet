@@ -1,19 +1,13 @@
 import { simulateMove } from "./demo.ts";
+import {
+  type ErrorResponse,
+  type MoveRequest,
+  type MoveResponse,
+  MUTATION_TOKEN_HEADER,
+  type ReportResponse,
+} from "./protocol.ts";
 import index from "./public/index.html";
 import { moveGeneratedDirectories, type ScanReport, scanWorkspace, type TrashResult } from "./scanner.ts";
-
-/** Response bodies, shared with the browser client. */
-export interface ReportResponse {
-  report: ScanReport;
-  mutationToken: string;
-}
-export interface MoveResponse extends ReportResponse {
-  result: TrashResult;
-}
-export interface ErrorResponse {
-  message: string;
-}
-export const MUTATION_TOKEN_HEADER = "x-worktree-diet-token";
 
 export interface LocalServer {
   url: string;
@@ -90,7 +84,7 @@ function demoWorkspace(initial: ScanReport): Workspace {
   };
 }
 
-function parseMoveRequest(value: unknown): { worktreePath: string } {
+function parseMoveRequest(value: unknown): MoveRequest {
   if (value && typeof value === "object" && "worktreePath" in value && typeof value.worktreePath === "string")
     return { worktreePath: value.worktreePath };
   throw new HttpError(400, "Provide the selected worktree path.");

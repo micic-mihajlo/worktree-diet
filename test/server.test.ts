@@ -2,7 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createDemoReport } from "../src/demo.ts";
-import { type LocalServer, MUTATION_TOKEN_HEADER, type ReportResponse, startServer } from "../src/server.ts";
+import { MUTATION_TOKEN_HEADER, type ReportResponse } from "../src/protocol.ts";
+import { type LocalServer, startServer } from "../src/server.ts";
 import { cleanTemporaryRoots, makeRepository, temporaryDirectory } from "./helpers.ts";
 
 let server: LocalServer | undefined;

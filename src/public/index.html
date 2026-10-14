@@ -6,6 +6,8 @@
   <meta name="color-scheme" content="light dark" />
   <title>Worktree Diet</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='15' fill='%232563eb'/%3E%3Cpath d='M18 22h28M18 32h19M18 42h10' stroke='white' stroke-width='5.5' stroke-linecap='round'/%3E%3C/svg%3E" />
+  <link rel="preload" href="/fonts/Geist-Variable.woff2" as="font" type="font/woff2" crossorigin />
+  <link rel="preload" href="/fonts/GeistPixel-Square.woff2" as="font" type="font/woff2" crossorigin />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
@@ -29,19 +31,26 @@
 
     <div class="layout">
       <main class="overview">
-        <section class="hero" aria-live="polite">
-          <span class="eyebrow">Ready to reclaim</span>
-          <p class="hero-number"><span id="ready-value">—</span><small id="ready-unit"></small></p>
-          <p id="hero-detail" class="hero-detail">Scanning your worktrees…</p>
-          <div id="status-bar" class="status-bar" role="img" aria-label="Generated storage by recommendation"></div>
+        <section class="hero">
+          <div class="hero-head">
+            <div aria-live="polite">
+              <span class="eyebrow">Ready to reclaim</span>
+              <p class="hero-number"><span id="ready-value">—</span><small id="ready-unit"></small></p>
+            </div>
+            <p id="hero-detail" class="hero-detail">Scanning your worktrees…</p>
+          </div>
+          <div id="meter" class="meter" role="img" aria-label="Generated storage by recommendation">
+            <i class="layer freed"></i><i class="layer recent"></i><i class="layer review"></i><i class="layer likely-inactive"></i><i class="meter-cover"></i>
+          </div>
+          <div id="meter-labels" class="meter-labels" aria-hidden="true"></div>
         </section>
 
         <div class="controls">
           <nav class="filters" aria-label="Filter worktrees">
-            <button type="button" data-filter="all" aria-pressed="true"><span>All</span><b id="all-size">—</b></button>
-            <button type="button" data-filter="likely-inactive" aria-pressed="false"><i class="dot likely-inactive" aria-hidden="true"></i><span>Ready to clean</span><b id="likely-inactive-size">—</b></button>
-            <button type="button" data-filter="review" aria-pressed="false"><i class="dot review" aria-hidden="true"></i><span>Needs review</span><b id="review-size">—</b></button>
-            <button type="button" data-filter="recent" aria-pressed="false"><i class="dot recent" aria-hidden="true"></i><span>Recently active</span><b id="recent-size">—</b></button>
+            <button type="button" data-filter="all" aria-pressed="true"><span>All</span><b id="all-count">—</b></button>
+            <button type="button" data-filter="likely-inactive" aria-pressed="false"><i class="dot likely-inactive" aria-hidden="true"></i><span>Ready to clean</span><b id="likely-inactive-count">—</b></button>
+            <button type="button" data-filter="review" aria-pressed="false"><i class="dot review" aria-hidden="true"></i><span>Needs review</span><b id="review-count">—</b></button>
+            <button type="button" data-filter="recent" aria-pressed="false"><i class="dot recent" aria-hidden="true"></i><span>Recently active</span><b id="recent-count">—</b></button>
           </nav>
           <label class="search">
             <svg aria-hidden="true" viewBox="0 0 20 20"><circle cx="8.5" cy="8.5" r="5.5"></circle><path d="m13 13 4 4"></path></svg>

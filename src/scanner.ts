@@ -62,7 +62,7 @@ function formatByteCount(bytes: number): string {
   if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
 }
-function generatedCategory(directoryName: string): Category {
+export function generatedCategory(directoryName: string): Category {
   if (dependencyDirectories[directoryName]) return "dependencies";
   if (buildDirectories[directoryName]) return "buildOutput";
   if (cacheDirectories[directoryName]) return "caches";
@@ -87,7 +87,7 @@ function parseWorktreeList(output: string): DiscoveredWorktree[] {
   return records;
 }
 function allocationFor(file: { blocks?: number; size: number }): number { return typeof file.blocks === "number" && file.blocks >= 0 ? file.blocks * 512 : file.size; }
-function activityFor(record: Pick<WorktreeRecord, "status" | "lastCommitAt" | "generatedAllocatedBytes">): WorktreeRecord["activity"] {
+export function activityFor(record: Pick<WorktreeRecord, "status" | "lastCommitAt" | "generatedAllocatedBytes">): WorktreeRecord["activity"] {
   const ageDays = record.lastCommitAt === null ? null : Math.max(0, (Date.now() - record.lastCommitAt) / 86_400_000);
   const ageReason = ageDays === null ? "Last commit time is unavailable" : `Last commit was ${Math.floor(ageDays)} days ago`;
   const allocationReason = `${formatByteCount(record.generatedAllocatedBytes)} of generated files can be moved to Trash`;
@@ -193,9 +193,12 @@ export async function scanWorkspace(inputPaths: readonly string[]): Promise<Scan
     repositories.set(scanned.repository.id, scanned.repository);
     for (const worktree of scanned.worktrees) worktrees.set(worktree.path, worktree);
   }
-  const records = [...worktrees.values()].sort((left, right) => right.generatedAllocatedBytes - left.generatedAllocatedBytes || left.path.localeCompare(right.path));
+  return buildReport(roots, [...repositories.values()], [...worktrees.values()], discoveryWarnings);
+}
+export function buildReport(roots: string[], repositories: ScanReport["repositories"], worktrees: WorktreeRecord[], discoveryWarnings: ScanWarning[] = []): ScanReport {
+  const records = [...worktrees].sort((left, right) => right.generatedAllocatedBytes - left.generatedAllocatedBytes || left.path.localeCompare(right.path));
   const totals = records.reduce((total, record) => addSizes(total, record.sizes), emptySizes()); const allocatedTotals = records.reduce((total, record) => addSizes(total, record.allocatedSizes), emptySizes());
-  return { roots, repositories: [...repositories.values()], repositoryPath: [...repositories.values()][0]?.path ?? "", worktrees: records, totals, allocatedTotals, totalBytes: totalSizes(totals), allocatedBytes: totalSizes(allocatedTotals), generatedBytes: generatedTotal(totals), generatedAllocatedBytes: generatedTotal(allocatedTotals), warnings: [...discoveryWarnings, ...records.flatMap((record) => record.warnings)], scannedAt: Date.now() };
+  return { roots, repositories, repositoryPath: repositories[0]?.path ?? "", worktrees: records, totals, allocatedTotals, totalBytes: totalSizes(totals), allocatedBytes: totalSizes(allocatedTotals), generatedBytes: generatedTotal(totals), generatedAllocatedBytes: generatedTotal(allocatedTotals), warnings: [...discoveryWarnings, ...records.flatMap((record) => record.warnings)], scannedAt: Date.now() };
 }
 export async function scanRepository(inputPath: string): Promise<ScanReport> {
   const report = await scanWorkspace([inputPath]);

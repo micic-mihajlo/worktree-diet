@@ -1,8 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { link, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdir, mkdtemp, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { moveGeneratedDirectories, scanRepository, scanWorkspace } from "../src/scanner.ts";
+import {
+  activityFor,
+  generatedCategory,
+  moveGeneratedDirectories,
+  parseWorktreeList,
+  scanRepository,
+  scanWorkspace,
+} from "../src/scanner.ts";
 
 const temporaryRoots: string[] = [];
 async function git(cwd: string, ...args: string[]): Promise<void> {
@@ -141,6 +148,7 @@ describe("workspace scanner", () => {
     const canonicalLinked = await realpath(linked);
     const record = report.worktrees.find((worktree) => worktree.path === canonicalLinked);
     expect(record?.activity.state).toBe("recent");
+    expect(record?.activity.cause).toBe("active");
     expect(record?.activity.reasons.some((reason) => reason.includes("Git status is clean"))).toBe(true);
     expect(record?.activity.reasons.some((reason) => reason.includes("Last commit was"))).toBe(true);
   });
@@ -170,9 +178,112 @@ describe("workspace scanner", () => {
     );
     expect(await Bun.file(join(root, "dist", "bundle")).exists()).toBe(true);
   });
+  test("skips a worktree whose folder was deleted without pruning, instead of failing the scan", async () => {
+    const { root, linked } = await makeRepository();
+    await rm(linked, { recursive: true, force: true });
+    const report = await scanRepository(root);
+    expect(report.worktrees.map((worktree) => worktree.path)).toEqual([await realpath(root)]);
+    expect(report.warnings.some((warning) => warning.path === linked && warning.message.includes("missing"))).toBe(
+      true,
+    );
+  });
+  test("treats folders named like Object.prototype members as source, not generated", async () => {
+    const { root } = await makeRepository();
+    for (const name of ["constructor", "toString", "__proto__"]) {
+      await mkdir(join(root, name));
+      await writeFile(join(root, name, "file.ts"), "source");
+    }
+    const report = await scanRepository(root);
+    expect(report.worktrees.flatMap((worktree) => worktree.generatedDirectories)).toEqual([]);
+    expect(generatedCategory("constructor")).toBe("sourceOther");
+    expect(generatedCategory("node_modules")).toBe("dependencies");
+  });
+  test("attributes a file hardlinked across worktrees to its alphabetically first path, on every scan", async () => {
+    const { root, linked } = await makeRepository();
+    await mkdir(join(root, "node_modules"));
+    await mkdir(join(linked, "node_modules"));
+    await writeFile(join(root, "node_modules", "shared.bin"), "x".repeat(4096));
+    await link(join(root, "node_modules", "shared.bin"), join(linked, "node_modules", "shared.bin"));
+    // "<root>/feature worktree/…" sorts before "<root>/node_modules/…", so the linked worktree owns it.
+    const owner = await realpath(linked);
+    for (let scan = 0; scan < 5; scan++) {
+      const report = await scanRepository(root);
+      expect(report.generatedBytes).toBe(4096);
+      for (const worktree of report.worktrees) expect(worktree.generatedBytes).toBe(worktree.path === owner ? 4096 : 0);
+    }
+  });
+  test("skips a folder whose parent was swapped for a symlink after the scan", async () => {
+    const { root } = await makeRepository();
+    const outside = await mkdtemp(join(tmpdir(), "worktree-diet-outside-"));
+    temporaryRoots.push(outside);
+    await mkdir(join(root, "packages", "app", "dist"), { recursive: true });
+    await writeFile(join(root, "packages", "app", "dist", "bundle"), "inside");
+    const report = await scanRepository(root);
+    await mkdir(join(outside, "app", "dist"), { recursive: true });
+    await writeFile(join(outside, "app", "dist", "bundle"), "outside");
+    await rename(join(root, "packages"), join(root, "packages-moved"));
+    await symlink(outside, join(root, "packages"));
+    const result = await moveGeneratedDirectories(report, root, { trashRoot: join(outside, "trash") });
+    expect(result.moved).toEqual([]);
+    expect(result.warnings[0]?.message).toContain("location changed");
+    expect(await Bun.file(join(outside, "app", "dist", "bundle")).text()).toBe("outside");
+  });
+  test("creates no Trash folder when nothing is moved", async () => {
+    const { root } = await makeRepository();
+    const trash = await mkdtemp(join(tmpdir(), "worktree-diet-trash-"));
+    temporaryRoots.push(trash);
+    await mkdir(join(root, "dist"));
+    await writeFile(join(root, "dist", "bundle"), "artifact");
+    const report = await scanRepository(root);
+    await rm(join(root, "dist"), { recursive: true });
+    const result = await moveGeneratedDirectories(report, root, { trashRoot: trash });
+    expect(result.moved).toEqual([]);
+    expect(result.warnings).toHaveLength(1);
+    expect(await readdir(trash)).toEqual([]);
+  });
   test("returns a useful error for non-Git input", async () => {
     const path = await mkdtemp(join(tmpdir(), "worktree-diet-not-git-"));
     temporaryRoots.push(path);
     await expect(scanRepository(path)).rejects.toThrow("Not a Git repository");
   });
+});
+
+describe("worktree list parsing", () => {
+  test("reads branches, detached and bare entries, and ignores extra attributes", () => {
+    const output = [
+      "worktree /repo.git\nbare",
+      "worktree /work/main\nHEAD 1111\nbranch refs/heads/main",
+      "worktree /work/feature/refs/heads\nHEAD 2222\nbranch refs/heads/feature/refs/heads",
+      "worktree /work/detached\nHEAD 3333\ndetached",
+      "worktree /work/gone\nHEAD 4444\nbranch refs/heads/gone\nprunable gitdir file points to non-existent location",
+      "",
+    ].join("\n\n");
+    expect(parseWorktreeList(output)).toEqual([
+      { path: "/repo.git", branch: "Detached HEAD", bare: true },
+      { path: "/work/main", branch: "main", bare: false },
+      { path: "/work/feature/refs/heads", branch: "feature/refs/heads", bare: false },
+      { path: "/work/detached", branch: "Detached HEAD", bare: false },
+      { path: "/work/gone", branch: "gone", bare: false },
+    ]);
+  });
+});
+
+describe("activity classification", () => {
+  const now = Date.UTC(2026, 9, 1);
+  const daysAgo = (days: number) => now - days * 86_400_000;
+  const cases = [
+    ["idle: clean, generated files, 30+ days", "clean", daysAgo(45), 100, "likely-inactive", "idle"],
+    ["dirty wins over age", "dirty", daysAgo(45), 100, "review", "dirty"],
+    ["unknown commit time", "clean", null, 100, "review", "no-commit-time"],
+    ["old but nothing to reclaim", "clean", daysAgo(45), 0, "review", "nothing-to-reclaim"],
+    ["old but status unknown", "unknown", daysAgo(45), 100, "review", "status-unknown"],
+    ["past a week, not yet inactive", "clean", daysAgo(12), 100, "review", "aging"],
+    ["committed this week", "clean", daysAgo(2), 100, "recent", "active"],
+    ["this week, status unknown", "unknown", daysAgo(2), 100, "recent", "active"],
+  ] as const;
+  for (const [name, status, lastCommitAt, generatedAllocatedBytes, state, cause] of cases) {
+    test(name, () => {
+      expect(activityFor({ status, lastCommitAt, generatedAllocatedBytes }, now)).toMatchObject({ state, cause });
+    });
+  }
 });

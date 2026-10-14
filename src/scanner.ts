@@ -1,10 +1,20 @@
-import type { Dirent } from "node:fs";
-import { lstat, mkdir, readdir, realpath, rename, stat } from "node:fs/promises";
+import type { Dirent, Stats } from "node:fs";
+import { lstat, mkdir, readdir, realpath, rename } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, join, relative, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 export type Category = "dependencies" | "buildOutput" | "caches" | "sourceOther";
+export type GeneratedCategory = Exclude<Category, "sourceOther">;
 export type ActivityState = "likely-inactive" | "review" | "recent";
+/** Why a worktree got its state, so the UI can explain it without re-deriving the rules. */
+export type ActivityCause =
+  | "idle" // likely-inactive: clean, has generated files, and no commit for INACTIVE_COMMIT_AGE_DAYS
+  | "dirty" // review: uncommitted changes
+  | "no-commit-time" // review: the last commit time could not be read
+  | "nothing-to-reclaim" // review: older than a week but has no generated files
+  | "status-unknown" // review: older than a week but Git status could not be read
+  | "aging" // review: clean, older than a week, but not yet inactive
+  | "active"; // recent: committed to within RECENT_COMMIT_AGE_DAYS
 
 export interface CategorySizes {
   dependencies: number;
@@ -19,9 +29,18 @@ export interface ScanWarning {
 export interface GeneratedDirectory {
   path: string;
   name: string;
-  category: Exclude<Category, "sourceOther">;
+  category: GeneratedCategory;
   logicalBytes: number;
   allocatedBytes: number;
+}
+export interface Activity {
+  state: ActivityState;
+  cause: ActivityCause;
+  reasons: string[];
+}
+export interface Repository {
+  id: string;
+  path: string;
 }
 export interface WorktreeRecord {
   repositoryId: string;
@@ -36,14 +55,13 @@ export interface WorktreeRecord {
   allocatedBytes: number;
   generatedBytes: number;
   generatedAllocatedBytes: number;
-  activity: { state: ActivityState; reasons: string[] };
+  activity: Activity;
   generatedDirectories: GeneratedDirectory[];
   warnings: ScanWarning[];
 }
 export interface ScanReport {
   roots: string[];
-  repositories: { id: string; path: string }[];
-  repositoryPath: string;
+  repositories: Repository[];
   worktrees: WorktreeRecord[];
   totals: CategorySizes;
   allocatedTotals: CategorySizes;
@@ -64,30 +82,38 @@ export const INACTIVE_COMMIT_AGE_DAYS = 30;
 export const RECENT_COMMIT_AGE_DAYS = 7;
 export const MIN_RECLAIMABLE_ALLOCATED_BYTES = 1;
 export const DISCOVERY_MAX_DEPTH = 4;
-const dependencyDirectories: Record<string, true> = {
-  node_modules: true,
-  ".venv": true,
-  venv: true,
-  ".tox": true,
-  vendor: true,
+/** Filesystem calls in flight at once. Throughput plateaus around 32–64 and drops past that from contention. */
+const FILESYSTEM_CONCURRENCY = 32;
+/** Git processes running at once. */
+const GIT_CONCURRENCY = 8;
+const DAY_MS = 86_400_000;
+
+const generatedDirectoryNames: Record<string, GeneratedCategory> = {
+  node_modules: "dependencies",
+  ".venv": "dependencies",
+  venv: "dependencies",
+  ".tox": "dependencies",
+  vendor: "dependencies",
+  target: "buildOutput",
+  ".next": "buildOutput",
+  dist: "buildOutput",
+  build: "buildOutput",
+  out: "buildOutput",
+  coverage: "buildOutput",
+  ".output": "buildOutput",
+  ".turbo": "caches",
+  ".cache": "caches",
+  ".parcel-cache": "caches",
+  ".vite": "caches",
+  ".eslintcache": "caches",
+  ".nx": "caches",
 };
-const buildDirectories: Record<string, true> = {
-  target: true,
-  ".next": true,
-  dist: true,
-  build: true,
-  out: true,
-  coverage: true,
-  ".output": true,
-};
-const cacheDirectories: Record<string, true> = {
-  ".turbo": true,
-  ".cache": true,
-  ".parcel-cache": true,
-  ".vite": true,
-  ".eslintcache": true,
-  ".nx": true,
-};
+
+export function generatedCategory(directoryName: string): Category {
+  return Object.hasOwn(generatedDirectoryNames, directoryName)
+    ? (generatedDirectoryNames[directoryName] ?? "sourceOther")
+    : "sourceOther";
+}
 
 function emptySizes(): CategorySizes {
   return { dependencies: 0, buildOutput: 0, caches: 0, sourceOther: 0 };
@@ -112,195 +138,337 @@ function formatByteCount(bytes: number): string {
   if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
   return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
 }
-export function generatedCategory(directoryName: string): Category {
-  if (dependencyDirectories[directoryName]) return "dependencies";
-  if (buildDirectories[directoryName]) return "buildOutput";
-  if (cacheDirectories[directoryName]) return "caches";
-  return "sourceOther";
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "unknown error";
 }
-async function runGit(
-  args: string[],
-  cwd: string,
-): Promise<{ ok: true; output: string } | { ok: false; error: string }> {
+/** Allocated size prefers block accounting, which reflects what deleting the file would free. */
+function allocationFor(file: Pick<Stats, "blocks" | "size">): number {
+  return typeof file.blocks === "number" && file.blocks >= 0 ? file.blocks * 512 : file.size;
+}
+
+/** Runs at most `limit` tasks at once. Only wrap leaf operations: a task that awaits more limited work can deadlock. */
+function concurrencyLimit(limit: number) {
+  let active = 0;
+  const waiting: (() => void)[] = [];
+  return async <T>(task: () => Promise<T>): Promise<T> => {
+    if (active >= limit) await new Promise<void>((resolve) => waiting.push(resolve));
+    active += 1;
+    try {
+      return await task();
+    } finally {
+      active -= 1;
+      waiting.shift()?.();
+    }
+  };
+}
+type Limit = ReturnType<typeof concurrencyLimit>;
+
+type GitResult = { ok: true; output: string } | { ok: false; error: string };
+async function runGit(args: string[], cwd: string): Promise<GitResult> {
   try {
-    const process = Bun.spawn(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
+    const child = Bun.spawn(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
     const [code, output, error] = await Promise.all([
-      process.exited,
-      new Response(process.stdout).text(),
-      new Response(process.stderr).text(),
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
     ]);
     return code === 0 ? { ok: true, output } : { ok: false, error: error.trim() || `git exited with ${code}` };
   } catch (error) {
     return { ok: false, error: error instanceof Error ? error.message : "Unable to start git" };
   }
 }
-interface DiscoveredWorktree {
+
+interface ListedWorktree {
   path: string;
   branch: string;
+  bare: boolean;
 }
-function parseWorktreeList(output: string): DiscoveredWorktree[] {
-  const records: DiscoveredWorktree[] = [];
-  let path: string | undefined;
-  let branch: string | undefined;
-  for (const line of output.split("\n")) {
-    if (line === "") {
-      if (path) records.push({ path, branch: branch ? branch.replace("refs/heads/", "") : "Detached HEAD" });
-      path = undefined;
-      branch = undefined;
-    } else if (line.startsWith("worktree ")) path = line.slice(9);
-    else if (line.startsWith("branch ")) branch = line.slice(7);
+export function parseWorktreeList(output: string): ListedWorktree[] {
+  const records: ListedWorktree[] = [];
+  for (const block of output.split(/\n\n+/)) {
+    let path: string | undefined;
+    let branch = "Detached HEAD";
+    let bare = false;
+    for (const line of block.split("\n")) {
+      if (line.startsWith("worktree ")) path = line.slice("worktree ".length);
+      else if (line.startsWith("branch ")) branch = line.slice("branch ".length).replace(/^refs\/heads\//, "");
+      else if (line === "bare") bare = true;
+    }
+    if (path) records.push({ path, branch, bare });
   }
-  if (path) records.push({ path, branch: branch ? branch.replace("refs/heads/", "") : "Detached HEAD" });
   return records;
 }
-function allocationFor(file: { blocks?: number; size: number }): number {
-  return typeof file.blocks === "number" && file.blocks >= 0 ? file.blocks * 512 : file.size;
-}
+
 export function activityFor(
   record: Pick<WorktreeRecord, "status" | "lastCommitAt" | "generatedAllocatedBytes">,
-): WorktreeRecord["activity"] {
-  const ageDays = record.lastCommitAt === null ? null : Math.max(0, (Date.now() - record.lastCommitAt) / 86_400_000);
-  const ageReason =
-    ageDays === null ? "Last commit time is unavailable" : `Last commit was ${Math.floor(ageDays)} days ago`;
-  const allocationReason = `${formatByteCount(record.generatedAllocatedBytes)} of generated files can be moved to Trash`;
-  if (
-    record.status === "clean" &&
-    record.generatedAllocatedBytes >= MIN_RECLAIMABLE_ALLOCATED_BYTES &&
-    ageDays !== null &&
-    ageDays >= INACTIVE_COMMIT_AGE_DAYS
-  )
-    return { state: "likely-inactive", reasons: [allocationReason, "Git status is clean", ageReason] };
-  if (record.status === "dirty")
-    return { state: "review", reasons: [allocationReason, "Git status has uncommitted changes", ageReason] };
-  if (ageDays === null || ageDays > RECENT_COMMIT_AGE_DAYS)
-    return {
-      state: "review",
-      reasons: [
-        allocationReason,
-        record.status === "clean" ? "Git status is clean" : "Git status is unavailable",
-        ageReason,
-      ],
-    };
-  return {
-    state: "recent",
-    reasons: [
-      allocationReason,
-      record.status === "clean" ? "Git status is clean" : "Git status is unavailable",
-      ageReason,
-    ],
-  };
+  now = Date.now(),
+): Activity {
+  const ageDays = record.lastCommitAt === null ? null : Math.max(0, (now - record.lastCommitAt) / DAY_MS);
+  const hasGenerated = record.generatedAllocatedBytes >= MIN_RECLAIMABLE_ALLOCATED_BYTES;
+  const reasons = [
+    `${formatByteCount(record.generatedAllocatedBytes)} of generated files can be moved to Trash`,
+    record.status === "clean"
+      ? "Git status is clean"
+      : record.status === "dirty"
+        ? "Git status has uncommitted changes"
+        : "Git status is unavailable",
+    ageDays === null ? "Last commit time is unavailable" : `Last commit was ${Math.floor(ageDays)} days ago`,
+  ];
+  const activity = (state: ActivityState, cause: ActivityCause): Activity => ({ state, cause, reasons });
+
+  if (record.status === "clean" && hasGenerated && ageDays !== null && ageDays >= INACTIVE_COMMIT_AGE_DAYS)
+    return activity("likely-inactive", "idle");
+  if (record.status === "dirty") return activity("review", "dirty");
+  if (ageDays === null) return activity("review", "no-commit-time");
+  if (ageDays > RECENT_COMMIT_AGE_DAYS) {
+    if (!hasGenerated) return activity("review", "nothing-to-reclaim");
+    if (record.status !== "clean") return activity("review", "status-unknown");
+    return activity("review", "aging");
+  }
+  return activity("recent", "active");
 }
-interface Measurement {
+
+/** Where a measured file's bytes are added: its worktree, and its generated directory if it is inside one. */
+interface Tally {
   logical: CategorySizes;
   allocated: CategorySizes;
-  warnings: ScanWarning[];
-  generatedDirectories: GeneratedDirectory[];
 }
-async function measureDirectory(
+interface Claim {
+  path: string;
+  category: Category;
+  logical: number;
+  allocated: number;
+  tally: Tally;
+  directory: GeneratedDirectory | undefined;
+}
+function addToTally(claim: Omit<Claim, "path">): void {
+  claim.tally.logical[claim.category] += claim.logical;
+  claim.tally.allocated[claim.category] += claim.allocated;
+  if (claim.directory) {
+    claim.directory.logicalBytes += claim.logical;
+    claim.directory.allocatedBytes += claim.allocated;
+  }
+}
+
+/**
+ * Hardlinked files (pnpm stores, shared caches) are counted once per scan, for the alphabetically first
+ * path that links to them. Deciding after traversal keeps sizes identical between scans however the
+ * parallel walk happens to be ordered. Files with a single link can't be double-counted, so they skip this.
+ */
+class HardlinkLedger {
+  readonly #claims = new Map<string, Claim>();
+  claim(file: Stats, claim: Claim): void {
+    const identity = `${file.dev}:${file.ino}`;
+    const current = this.#claims.get(identity);
+    if (!current || claim.path < current.path) this.#claims.set(identity, claim);
+  }
+  settle(): void {
+    for (const claim of this.#claims.values()) addToTally(claim);
+  }
+}
+
+interface Measurement extends Tally {
+  generatedDirectories: GeneratedDirectory[];
+  warnings: ScanWarning[];
+}
+async function measureWorktree(
   root: string,
   excludedRoots: ReadonlySet<string>,
-  seenFiles: Set<string>,
+  ledger: HardlinkLedger,
+  io: Limit,
 ): Promise<Measurement> {
-  const logical = emptySizes();
-  const allocated = emptySizes();
-  const warnings: ScanWarning[] = [];
+  const tally: Tally = { logical: emptySizes(), allocated: emptySizes() };
   const generatedDirectories: GeneratedDirectory[] = [];
-  const visit = async (directory: string, category: Category): Promise<void> => {
+  const warnings: ScanWarning[] = [];
+
+  const visit = async (directory: string, category: Category, generated?: GeneratedDirectory): Promise<void> => {
     let entries: Dirent[];
     try {
-      entries = await readdir(directory, { withFileTypes: true });
+      entries = await io(() => readdir(directory, { withFileTypes: true }));
     } catch (error) {
-      warnings.push({
-        path: directory,
-        message: `Could not read directory: ${error instanceof Error ? error.message : "unknown error"}`,
-      });
+      warnings.push({ path: directory, message: `Could not read directory: ${errorMessage(error)}` });
       return;
     }
-    for (const entry of entries) {
-      const entryPath = join(directory, entry.name);
-      if (entry.isSymbolicLink()) {
-        if (category === "sourceOther") warnings.push({ path: entryPath, message: "Skipped symbolic link" });
-        continue;
-      }
-      if (entry.isDirectory()) {
-        if (entry.name === ".git" || excludedRoots.has(entryPath)) continue;
-        const entryCategory = category === "sourceOther" ? generatedCategory(entry.name) : category;
-        if (category === "sourceOther" && entryCategory !== "sourceOther") {
-          const beforeLogical = logical[entryCategory];
-          const beforeAllocated = allocated[entryCategory];
-          await visit(entryPath, entryCategory);
-          generatedDirectories.push({
-            path: entryPath,
-            name: entry.name,
-            category: entryCategory,
-            logicalBytes: logical[entryCategory] - beforeLogical,
-            allocatedBytes: allocated[entryCategory] - beforeAllocated,
-          });
-        } else await visit(entryPath, entryCategory);
-        continue;
-      }
-      if (!entry.isFile()) continue;
-      try {
-        const file = await stat(entryPath);
-        const identity = `${file.dev}:${file.ino}`;
-        if (seenFiles.has(identity)) continue;
-        seenFiles.add(identity);
-        logical[category] += file.size;
-        allocated[category] += allocationFor(file);
-      } catch (error) {
-        warnings.push({
-          path: entryPath,
-          message: `Could not measure file: ${error instanceof Error ? error.message : "unknown error"}`,
-        });
-      }
-    }
+    await Promise.all(
+      entries.map(async (entry) => {
+        const path = join(directory, entry.name);
+        if (entry.isSymbolicLink()) {
+          // Links inside generated folders are routine (node_modules/.bin); only note ones in source.
+          if (category === "sourceOther") warnings.push({ path, message: "Skipped symbolic link" });
+          return;
+        }
+        if (entry.isDirectory()) {
+          if (entry.name === ".git" || excludedRoots.has(path)) return;
+          const childCategory = category === "sourceOther" ? generatedCategory(entry.name) : category;
+          if (category === "sourceOther" && childCategory !== "sourceOther") {
+            // Only the outermost generated folder is listed; everything below it belongs to it.
+            const folder: GeneratedDirectory = {
+              path,
+              name: entry.name,
+              category: childCategory,
+              logicalBytes: 0,
+              allocatedBytes: 0,
+            };
+            generatedDirectories.push(folder);
+            return visit(path, childCategory, folder);
+          }
+          return visit(path, childCategory, generated);
+        }
+        if (!entry.isFile()) return;
+        try {
+          const file = await io(() => lstat(path));
+          const claim: Claim = {
+            path,
+            category,
+            logical: file.size,
+            allocated: allocationFor(file),
+            tally,
+            directory: generated,
+          };
+          if (file.nlink > 1) ledger.claim(file, claim);
+          else addToTally(claim);
+        } catch (error) {
+          warnings.push({ path, message: `Could not measure file: ${errorMessage(error)}` });
+        }
+      }),
+    );
   };
+
   await visit(root, "sourceOther");
-  return { logical, allocated, warnings, generatedDirectories };
+  // The walk is parallel, so order its results by path to keep reports stable.
+  generatedDirectories.sort((left, right) => left.path.localeCompare(right.path));
+  warnings.sort((left, right) => left.path.localeCompare(right.path));
+  return { ...tally, generatedDirectories, warnings };
 }
-async function repositoryIdentity(path: string): Promise<{ id: string; path: string } | undefined> {
-  const [commonResult, topLevelResult] = await Promise.all([
-    runGit(["rev-parse", "--git-common-dir"], path),
-    runGit(["rev-parse", "--show-toplevel"], path),
+
+async function repositoryIdentity(path: string, git: Limit): Promise<Repository | undefined> {
+  const [common, topLevel] = await Promise.all([
+    git(() => runGit(["rev-parse", "--git-common-dir"], path)),
+    git(() => runGit(["rev-parse", "--show-toplevel"], path)),
   ]);
-  if (!commonResult.ok || !topLevelResult.ok) return undefined;
+  if (!common.ok || !topLevel.ok) return undefined;
   try {
-    const common = await realpath(resolve(path, commonResult.output.trim()));
-    const topLevel = await realpath(topLevelResult.output.trim());
-    return { id: common, path: topLevel };
+    return { id: await realpath(resolve(path, common.output.trim())), path: await realpath(topLevel.output.trim()) };
   } catch {
     return undefined;
   }
 }
-async function inspectWorktree(
-  worktree: DiscoveredWorktree,
-  repository: { id: string; path: string },
-  allWorktreeRoots: ReadonlySet<string>,
-  seenFiles: Set<string>,
-): Promise<WorktreeRecord> {
-  const excludedRoots = new Set(allWorktreeRoots);
-  excludedRoots.delete(worktree.path);
-  const measured = await measureDirectory(worktree.path, excludedRoots, seenFiles);
-  const statusResult = await runGit(["status", "--porcelain"], worktree.path);
-  const status: WorktreeRecord["status"] = statusResult.ok
-    ? statusResult.output.trim() === ""
-      ? "clean"
-      : "dirty"
-    : "unknown";
-  const commitResult = await runGit(["log", "-1", "--format=%ct"], worktree.path);
-  const lastCommitAt =
-    commitResult.ok && /^\d+$/.test(commitResult.output.trim()) ? Number(commitResult.output.trim()) * 1000 : null;
+
+async function discoverRepositoryPaths(
+  inputPath: string,
+  io: Limit,
+  git: Limit,
+): Promise<{ paths: string[]; warnings: ScanWarning[] }> {
+  const requestedPath = resolve(inputPath);
+  const warnings: ScanWarning[] = [];
+  let root: string;
+  try {
+    root = await realpath(requestedPath);
+  } catch {
+    return { paths: [], warnings: [{ path: requestedPath, message: "Path does not exist" }] };
+  }
+  const paths: string[] = [];
+  const visit = async (directory: string, depth: number): Promise<void> => {
+    if (depth > DISCOVERY_MAX_DEPTH) return;
+    let entries: Dirent[];
+    try {
+      entries = await io(() => readdir(directory, { withFileTypes: true }));
+    } catch (error) {
+      warnings.push({ path: directory, message: `Could not discover repositories: ${errorMessage(error)}` });
+      return;
+    }
+    if (entries.some((entry) => entry.name === ".git" && (entry.isDirectory() || entry.isFile()))) {
+      paths.push(directory);
+      return;
+    }
+    await Promise.all(
+      entries
+        .filter(
+          (entry) =>
+            entry.isDirectory() &&
+            !entry.isSymbolicLink() &&
+            entry.name !== ".git" &&
+            generatedCategory(entry.name) === "sourceOther",
+        )
+        .map((entry) => visit(join(directory, entry.name), depth + 1)),
+    );
+  };
+  await visit(root, 0);
+  // A path inside a repository (rather than a parent of repositories) still counts.
+  if (paths.length === 0 && (await repositoryIdentity(root, git))) paths.push(root);
+  return { paths: paths.sort(), warnings };
+}
+
+interface PendingWorktree {
+  repository: Repository;
+  path: string;
+  branch: string;
+  measurement: Promise<Measurement>;
+  status: Promise<GitResult>;
+  lastCommit: Promise<GitResult>;
+}
+
+/** Lists a repository's worktrees and starts measuring each; missing worktree folders become warnings. */
+async function startRepository(
+  candidate: string,
+  identity: Repository,
+  ledger: HardlinkLedger,
+  io: Limit,
+  git: Limit,
+): Promise<{ repository: Repository; worktrees: PendingWorktree[]; warnings: ScanWarning[] }> {
+  const warnings: ScanWarning[] = [];
+  const listing = await git(() => runGit(["worktree", "list", "--porcelain"], candidate));
+  if (!listing.ok) {
+    warnings.push({ path: candidate, message: `Could not list worktrees: ${listing.error}` });
+    return { repository: identity, worktrees: [], warnings };
+  }
+  const listed = parseWorktreeList(listing.output).filter((worktree) => !worktree.bare);
+  const resolved = await Promise.allSettled(listed.map((worktree) => realpath(worktree.path)));
+  const worktrees: { path: string; branch: string }[] = [];
+  for (const [index, result] of resolved.entries()) {
+    const worktree = listed[index];
+    if (!worktree) continue;
+    if (result.status === "fulfilled") worktrees.push({ path: result.value, branch: worktree.branch });
+    else
+      warnings.push({
+        path: worktree.path,
+        message: "Worktree folder is missing; `git worktree prune` removes the stale entry",
+      });
+  }
+  // Git lists the main worktree first, so it names the repository.
+  const repository = { ...identity, path: worktrees[0]?.path ?? identity.path };
+  const roots = new Set(worktrees.map((worktree) => worktree.path));
+  return {
+    repository,
+    warnings,
+    worktrees: worktrees.map((worktree) => {
+      // Linked worktrees can sit inside the main one; each is measured on its own, never as part of another.
+      const excluded = new Set(roots);
+      excluded.delete(worktree.path);
+      return {
+        repository,
+        ...worktree,
+        measurement: measureWorktree(worktree.path, excluded, ledger, io),
+        status: git(() => runGit(["status", "--porcelain"], worktree.path)),
+        lastCommit: git(() => runGit(["log", "-1", "--format=%ct"], worktree.path)),
+      };
+    }),
+  };
+}
+
+async function finishWorktree(pending: PendingWorktree): Promise<WorktreeRecord> {
+  const [measured, status, lastCommit] = await Promise.all([pending.measurement, pending.status, pending.lastCommit]);
   const warnings = [...measured.warnings];
-  if (!statusResult.ok)
-    warnings.push({ path: worktree.path, message: `Could not read Git status: ${statusResult.error}` });
-  if (!commitResult.ok)
-    warnings.push({ path: worktree.path, message: `Could not read last commit: ${commitResult.error}` });
+  if (!status.ok) warnings.push({ path: pending.path, message: `Could not read Git status: ${status.error}` });
+  if (!lastCommit.ok) warnings.push({ path: pending.path, message: `Could not read last commit: ${lastCommit.error}` });
+  const commitSeconds = lastCommit.ok ? lastCommit.output.trim() : "";
   const base = {
-    repositoryId: repository.id,
-    repositoryPath: repository.path,
-    ...worktree,
-    status,
-    lastCommitAt,
+    repositoryId: pending.repository.id,
+    repositoryPath: pending.repository.path,
+    branch: pending.branch,
+    path: pending.path,
+    status: status.ok ? (status.output.trim() === "" ? ("clean" as const) : ("dirty" as const)) : ("unknown" as const),
+    lastCommitAt: /^\d+$/.test(commitSeconds) ? Number(commitSeconds) * 1000 : null,
     sizes: measured.logical,
     allocatedSizes: measured.allocated,
     totalBytes: totalSizes(measured.logical),
@@ -312,97 +480,49 @@ async function inspectWorktree(
   };
   return { ...base, activity: activityFor(base) };
 }
-async function scanOneRepository(
-  path: string,
-  seenFiles: Set<string>,
-): Promise<{ repository: { id: string; path: string }; worktrees: WorktreeRecord[] } | undefined> {
-  const repository = await repositoryIdentity(path);
-  if (!repository) return undefined;
-  const discovery = await runGit(["worktree", "list", "--porcelain"], path);
-  if (!discovery.ok) return undefined;
-  const worktrees = await Promise.all(
-    parseWorktreeList(discovery.output).map(async (worktree) => ({ ...worktree, path: await realpath(worktree.path) })),
-  );
-  const displayRepository = { ...repository, path: worktrees[0]?.path ?? repository.path };
-  const roots = new Set(worktrees.map((worktree) => worktree.path));
-  return {
-    repository: displayRepository,
-    worktrees: await Promise.all(
-      worktrees.map((worktree) => inspectWorktree(worktree, displayRepository, roots, seenFiles)),
-    ),
-  };
-}
-async function discoverRepositoryPaths(inputPath: string): Promise<{ paths: string[]; warnings: ScanWarning[] }> {
-  const requestedPath = resolve(inputPath);
-  const warnings: ScanWarning[] = [];
-  let root: string;
-  try {
-    root = await realpath(requestedPath);
-  } catch {
-    warnings.push({ path: requestedPath, message: "Path does not exist" });
-    return { paths: [], warnings };
-  }
-  const paths: string[] = [];
-  const visit = async (directory: string, depth: number): Promise<void> => {
-    if (depth > DISCOVERY_MAX_DEPTH) return;
-    let entries: Dirent[];
-    try {
-      entries = await readdir(directory, { withFileTypes: true });
-    } catch (error) {
-      warnings.push({
-        path: directory,
-        message: `Could not discover repositories: ${error instanceof Error ? error.message : "unknown error"}`,
-      });
-      return;
-    }
-    if (entries.some((entry) => entry.name === ".git" && (entry.isDirectory() || entry.isFile()))) {
-      paths.push(directory);
-      return;
-    }
-    for (const entry of entries) {
-      if (
-        !entry.isDirectory() ||
-        entry.isSymbolicLink() ||
-        entry.name === ".git" ||
-        generatedCategory(entry.name) !== "sourceOther"
-      )
-        continue;
-      await visit(join(directory, entry.name), depth + 1);
-    }
-  };
-  await visit(root, 0);
-  if (paths.length === 0 && (await repositoryIdentity(root))) paths.push(root);
-  return { paths, warnings };
-}
+
 export async function scanWorkspace(inputPaths: readonly string[]): Promise<ScanReport> {
   if (inputPaths.length === 0) throw new Error("Provide at least one repository or parent directory path.");
-  const roots: string[] = [];
-  const discoveryWarnings: ScanWarning[] = [];
-  const candidates = new Set<string>();
-  for (const inputPath of inputPaths) {
-    const discovery = await discoverRepositoryPaths(inputPath);
-    roots.push(resolve(inputPath));
-    discoveryWarnings.push(...discovery.warnings);
-    for (const path of discovery.paths) candidates.add(path);
+  const io = concurrencyLimit(FILESYSTEM_CONCURRENCY);
+  const git = concurrencyLimit(GIT_CONCURRENCY);
+  const roots = inputPaths.map((path) => resolve(path));
+
+  const discoveries = await Promise.all(roots.map((root) => discoverRepositoryPaths(root, io, git)));
+  const warnings = discoveries.flatMap((discovery) => discovery.warnings);
+  const candidates = [...new Set(discoveries.flatMap((discovery) => discovery.paths))].sort();
+
+  // Several candidates can be worktrees of one repository; scan each repository once.
+  const identities = await Promise.all(candidates.map((candidate) => repositoryIdentity(candidate, git)));
+  const unique = new Map<string, { candidate: string; identity: Repository }>();
+  for (const [index, identity] of identities.entries()) {
+    const candidate = candidates[index];
+    if (identity && candidate && !unique.has(identity.id)) unique.set(identity.id, { candidate, identity });
   }
-  const seenFiles = new Set<string>();
-  const repositories = new Map<string, { id: string; path: string }>();
-  const worktrees = new Map<string, WorktreeRecord>();
-  for (const candidate of candidates) {
-    const repository = await repositoryIdentity(candidate);
-    if (!repository || repositories.has(repository.id)) continue;
-    const scanned = await scanOneRepository(candidate, seenFiles);
-    if (!scanned) continue;
-    repositories.set(scanned.repository.id, scanned.repository);
-    for (const worktree of scanned.worktrees) worktrees.set(worktree.path, worktree);
-  }
-  return buildReport(roots, [...repositories.values()], [...worktrees.values()], discoveryWarnings);
+
+  const ledger = new HardlinkLedger();
+  const started = await Promise.all(
+    [...unique.values()].map(({ candidate, identity }) => startRepository(candidate, identity, ledger, io, git)),
+  );
+  const pending = started.flatMap((repository) => repository.worktrees);
+  // Every file must be seen before hardlinks are settled, so wait for all measurements first.
+  await Promise.all(pending.map((worktree) => worktree.measurement));
+  ledger.settle();
+
+  const records = new Map<string, WorktreeRecord>();
+  for (const record of await Promise.all(pending.map(finishWorktree))) records.set(record.path, record);
+  return buildReport(
+    roots,
+    started.map((repository) => repository.repository).sort((left, right) => left.path.localeCompare(right.path)),
+    [...records.values()],
+    [...warnings, ...started.flatMap((repository) => repository.warnings)],
+  );
 }
+
 export function buildReport(
   roots: string[],
-  repositories: ScanReport["repositories"],
+  repositories: Repository[],
   worktrees: WorktreeRecord[],
-  discoveryWarnings: ScanWarning[] = [],
+  scanWarnings: ScanWarning[] = [],
 ): ScanReport {
   const records = [...worktrees].sort(
     (left, right) =>
@@ -413,7 +533,6 @@ export function buildReport(
   return {
     roots,
     repositories,
-    repositoryPath: repositories[0]?.path ?? "",
     worktrees: records,
     totals,
     allocatedTotals,
@@ -421,58 +540,82 @@ export function buildReport(
     allocatedBytes: totalSizes(allocatedTotals),
     generatedBytes: generatedTotal(totals),
     generatedAllocatedBytes: generatedTotal(allocatedTotals),
-    warnings: [...discoveryWarnings, ...records.flatMap((record) => record.warnings)],
+    warnings: [...scanWarnings, ...records.flatMap((record) => record.warnings)],
     scannedAt: Date.now(),
   };
 }
+
 export async function scanRepository(inputPath: string): Promise<ScanReport> {
   const report = await scanWorkspace([inputPath]);
   if (report.repositories.length === 0)
     throw new Error(`Not a Git repository or repository parent: ${resolve(inputPath)}`);
   return report;
 }
+
+function isInside(parent: string, child: string): boolean {
+  const path = relative(parent, child);
+  return path !== "" && path !== ".." && !path.startsWith(`..${sep}`) && !isAbsolute(path);
+}
+
+/**
+ * Moves the generated folders the latest scan found in one worktree into a fresh Trash folder.
+ * Paths come only from the report, and each is re-checked first: still a real directory, still inside
+ * the worktree, and still at the same canonical path, so a parent swapped for a symlink since the scan
+ * can't redirect the move elsewhere.
+ */
 export async function moveGeneratedDirectories(
   report: ScanReport,
   worktreePath: string,
   options: { trashRoot?: string } = {},
 ): Promise<TrashResult> {
+  const notScanned = new Error("That worktree was not returned by the latest scan.");
   let canonicalWorktreePath: string;
   try {
     canonicalWorktreePath = await realpath(resolve(worktreePath));
   } catch {
-    throw new Error("That worktree was not returned by the latest scan.");
+    throw notScanned;
   }
   const worktree = report.worktrees.find((record) => record.path === canonicalWorktreePath);
-  if (!worktree) throw new Error("That worktree was not returned by the latest scan.");
+  if (!worktree) throw notScanned;
+
   const trashRoot = options.trashRoot ?? join(homedir(), ".Trash", "Worktree Diet");
-  const destination = join(trashRoot, `${Date.now()}-${crypto.randomUUID()}`);
-  await mkdir(destination, { recursive: true });
+  const trashPath = join(trashRoot, `${Date.now()}-${crypto.randomUUID()}`);
+  let trashReady = false;
   const moved: TrashResult["moved"] = [];
   const warnings: ScanWarning[] = [];
+  const skip = (path: string, message: string) => warnings.push({ path, message });
+
   for (const directory of worktree.generatedDirectories) {
     try {
+      if (!isInside(worktree.path, directory.path)) {
+        skip(directory.path, "Skipped because it is outside the scanned worktree");
+        continue;
+      }
       const current = await lstat(directory.path);
-      if (!current.isDirectory() || current.isSymbolicLink()) {
-        warnings.push({ path: directory.path, message: "Skipped because it is no longer a real directory" });
+      if (!current.isDirectory()) {
+        skip(directory.path, "Skipped because it is no longer a real directory");
         continue;
       }
-      if (relative(worktree.path, directory.path).startsWith("..")) {
-        warnings.push({ path: directory.path, message: "Skipped because it is outside the scanned worktree" });
+      if ((await realpath(directory.path)) !== directory.path) {
+        skip(directory.path, "Skipped because its location changed since the scan");
         continue;
       }
-      const target = join(destination, `${moved.length}-${basename(directory.path)}`);
+      if (!trashReady) {
+        await mkdir(trashPath, { recursive: true });
+        trashReady = true;
+      }
+      const target = join(trashPath, `${moved.length}-${basename(directory.path)}`);
       await rename(directory.path, target);
       moved.push({ from: directory.path, to: target });
     } catch (error) {
       const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
-      warnings.push({
-        path: directory.path,
-        message:
-          code === "EXDEV"
-            ? "Could not move across volumes. Choose a Trash location on the same volume; nothing was deleted."
-            : `Could not move directory: ${error instanceof Error ? error.message : "unknown error"}`,
-      });
+      skip(
+        directory.path,
+        code === "EXDEV"
+          ? "Skipped because it is on a different volume from the Trash, so moving would mean copying; nothing was changed"
+          : `Could not move directory: ${errorMessage(error)}`,
+      );
     }
   }
-  return { moved, warnings, trashPath: destination };
+  return { moved, warnings, trashPath };
 }

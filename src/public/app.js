@@ -193,27 +193,20 @@ function drawMeter(bytes, readyBytes) {
   meterLayers.forEach((layer, index) => { end += counts[index]; ends[layer] = end; });
   const intro = introPending && !reducedMotion.matches;
   const moved = meter.ends ? Math.max(...meterLayers.map((layer) => Math.abs(ends[layer] - meter.ends[layer]))) : 0;
-  const duration = intro ? 0 : Math.min(1200, Math.max(450, moved * 45));
+  const duration = intro || moved === 0 ? 0 : Math.min(1200, Math.max(450, moved * 45));
   elements.hero.style.setProperty('--duration', `${duration}ms`);
 
-  let start = 0;
-  for (const [index, layer] of meterLayers.entries()) {
+  for (const layer of meterLayers) {
     const element = $(`.layer.${layer}`, elements.meter);
     element.style.setProperty('--steps', String(Math.max(1, Math.abs(ends[layer] - (meter.ends?.[layer] ?? 0)))));
     element.style.transform = `scaleX(${ends[layer] ? (ends[layer] * CELL_PITCH - CELL_GAP / 2) / width : 0})`;
-    const label = meter.labels[layer];
-    const span = counts[index] * CELL_PITCH - CELL_GAP;
-    label.innerHTML = `<i class="dot ${layer}"></i><b>${formatBytes(bytes[layer])}</b> ${meterWords[layer]}`;
-    label.style.width = `${Math.max(0, span)}px`;
-    label.style.setProperty('--steps', String(Math.max(1, Math.abs(start - (label.start ?? 0)))));
-    label.style.transform = `translateX(${start * CELL_PITCH}px)`;
-    if (intro) label.style.setProperty('--reveal-delay', `${Math.round(1100 * start / meter.columns)}ms`);
-    label.classList.toggle('is-empty', counts[index] === 0);
-    label.classList.toggle('is-hidden', span < 96);
-    label.start = start;
-    start = ends[layer];
   }
   meter.ends = ends;
+  // The legend changes in one step once the cells finish moving, so it never runs ahead of the meter
+  // or reflows the page mid-animation.
+  clearTimeout(meter.labelTimer);
+  if (duration && meter.labelsDrawn) meter.labelTimer = setTimeout(() => drawLabels(bytes, counts, ends, false), duration);
+  else drawLabels(bytes, counts, ends, intro);
 
   if (intro) {
     introPending = false;
@@ -232,6 +225,21 @@ function drawMeter(bytes, readyBytes) {
   }
 }
 
+// Labels flow left to right, each at least as wide as its segment, so a label that fits sits under its
+// segment and one that doesn't pushes the rest along (wrapping if needed) instead of being hidden.
+function drawLabels(bytes, counts, ends, intro) {
+  const last = meterLayers.findLast((layer) => bytes[layer] > 0);
+  for (const [index, layer] of meterLayers.entries()) {
+    const label = meter.labels[layer];
+    label.innerHTML = `<i class="dot ${layer}"></i><b>${formatBytes(bytes[layer])}</b> ${meterWords[layer]}`;
+    label.style.width = `${counts[index] * CELL_PITCH}px`;
+    if (intro) label.style.setProperty('--reveal-delay', `${Math.round(1100 * (ends[layer] - counts[index]) / meter.columns)}ms`);
+    label.classList.toggle('is-empty', bytes[layer] <= 0);
+    label.classList.toggle('is-last', layer === last);
+  }
+  meter.labelsDrawn = true;
+}
+
 function setReady(bytes) {
   const [value, unit] = byteParts(bytes);
   elements.readyValue.textContent = value;
@@ -242,7 +250,7 @@ function setReady(bytes) {
 }
 
 // Counts in the larger value's unit so the unit never flickers. While counting, the digits sit in a
-// box sized once to the widest string, on their own layer, so each tick re-lays-out and repaints only them.
+// box sized once to the widest string, on their own layer, so ticking never reflows or repaints the page.
 function animateReady(from, to, duration) {
   cancelAnimationFrame(readyAnimation);
   if (from === to || !duration || reducedMotion.matches) { setReady(to); return; }

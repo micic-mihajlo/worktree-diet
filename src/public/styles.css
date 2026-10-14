@@ -54,7 +54,7 @@ svg { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: 
 .hero-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 2.5rem; margin-bottom: 1.6rem; }
 .hero-number { display: flex; align-items: baseline; gap: .35rem; margin: .35rem 0 0; font-size: 4.5rem; font-weight: 600; line-height: .95; letter-spacing: -.055em; font-variant-numeric: tabular-nums; }
 .hero-number span { display: inline-block; }
-.hero-number span.is-counting { contain: layout style; will-change: transform; }
+.hero-number span.is-counting { will-change: transform; }
 .hero-number small, .inspector-number small { color: var(--soft); font-size: .42em; font-weight: 520; letter-spacing: -.02em; }
 .hero-detail { max-width: 22rem; margin: 0 0 .35rem; color: var(--muted); font-size: .92rem; line-height: 1.5; }
 .hero-detail strong { color: var(--ink); font-weight: 580; }
@@ -73,11 +73,14 @@ svg { fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: 
 .meter-cover { background: var(--track); }
 .hero.is-revealed .meter-cover { transform: translateX(100%); transition: transform var(--sweep, 0ms) steps(var(--columns, 1), jump-start); }
 .hero.is-instant .layer, .hero.is-instant .meter-cover, .hero.is-instant .meter-label { transition: none; }
-.meter-labels { position: relative; width: calc(var(--columns, 0) * var(--pitch)); height: 1.25rem; margin-top: .65rem; contain: strict; }
-.meter-label { position: absolute; top: 0; left: 0; display: flex; align-items: center; gap: .4rem; overflow: hidden; color: var(--muted); font-size: .8rem; white-space: nowrap; transition: transform var(--duration, 600ms) steps(var(--steps, 1), jump-end), opacity 180ms ease var(--reveal-delay, 0ms); }
+.meter-labels { display: flex; flex-wrap: wrap; row-gap: .35rem; width: calc(var(--columns, 0) * var(--pitch)); min-height: 1.2rem; margin-top: .65rem; contain: layout; }
+/* Width comes from the segment; min-width keeps the whole label visible, and padding keeps a gap when one pushes the next. */
+.meter-label { display: flex; flex: none; align-items: center; gap: .4rem; min-width: max-content; padding-right: .9rem; color: var(--muted); font-size: .8rem; white-space: nowrap; transition: opacity 180ms ease var(--reveal-delay, 0ms); }
 .hero:not(.is-revealed) .meter-label { opacity: 0; }
 .meter-label b { color: var(--ink); font-weight: 560; font-variant-numeric: tabular-nums; }
-.meter-label.is-hidden, .meter-label.is-empty { opacity: 0; }
+.meter-label.is-empty { display: none; }
+/* Labels only wrap at the right end, so a wrapped last label belongs flush right, under its segment. */
+.meter-label.is-last { margin-left: auto; padding-right: 0; }
 
 /* Filters double as the status bar's legend, so each one carries its size. */
 .controls { position: sticky; top: 0; z-index: 4; display: flex; align-items: center; gap: 1rem; padding: .7rem 2rem .9rem; background: var(--surface); }
@@ -213,10 +216,6 @@ dialog li span { color: var(--muted); font-variant-numeric: tabular-nums; }
   .storage-cell { grid-template-columns: 1fr; gap: .3rem; } .storage-cell .allocated { order: -1; }
   .size-bar { justify-content: flex-end; mask-image: repeating-linear-gradient(270deg, #000 0 6px, transparent 0 8px); } .size-bar i { transform-origin: right; }
   .hero-head { display: block; } .hero-detail { margin-top: .75rem; max-width: none; }
-  /* Too narrow to pin labels under their segments: fall back to a wrapping legend. */
-  .meter-labels { display: flex; flex-wrap: wrap; gap: .35rem 1rem; width: auto; height: auto; contain: none; }
-  .meter-label { position: static; width: auto !important; transform: none !important; }
-  .meter-label.is-hidden { opacity: 1; } .meter-label.is-empty { display: none; }
   .filters b { display: none; }
   .inspector-content, .inspector-action { padding-inline: 1rem; }
 }

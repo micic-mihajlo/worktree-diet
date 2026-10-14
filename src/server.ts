@@ -20,7 +20,13 @@ export interface ServerOptions {
   demo?: ScanReport;
 }
 
-class HttpError extends Error {
+/** Where reports come from and how moves happen: the real disk, or the in-memory demo. */
+export interface Workspace {
+  report(): Promise<ScanReport>;
+  move(worktreePath: string, confirmed?: readonly string[]): Promise<{ result: TrashResult; report: ScanReport }>;
+}
+
+export class HttpError extends Error {
   constructor(
     readonly status: number,
     message: string,
@@ -29,23 +35,25 @@ class HttpError extends Error {
   }
 }
 
-/** Where reports come from and how moves happen: the real disk, or the in-memory demo. */
-interface Workspace {
-  report(): Promise<ScanReport>;
-  move(worktreePath: string): Promise<{ result: TrashResult; report: ScanReport }>;
-}
-
-function diskWorkspace(inputPaths: readonly string[], trashRoot: string | undefined): Workspace {
+/**
+ * Scans and moves on disk. Takes its scan and move as functions so the coordination below can be tested
+ * with controlled timing.
+ */
+export function diskWorkspace(
+  scanDisk: () => Promise<ScanReport>,
+  moveOnDisk: (report: ScanReport, worktreePath: string, confirmed?: readonly string[]) => Promise<TrashResult>,
+): Workspace {
   let latest: ScanReport | undefined;
   let inFlight: { generation: number; scan: Promise<ScanReport> } | undefined;
-  // Bumped after every move, so a scan that started before or during the move never becomes `latest`.
+  // Bumped when a move starts and when it ends, so a scan that began before or during a move (and so may
+  // have seen folders half-moved) is returned to its caller but never becomes `latest`.
   let generation = 0;
 
   // Concurrent report requests share one scan instead of each walking the disk.
   const scan = (): Promise<ScanReport> => {
     if (inFlight?.generation === generation) return inFlight.scan;
     const startedAt = generation;
-    const scan = scanWorkspace(inputPaths)
+    const scan = scanDisk()
       .then((report) => {
         if (startedAt === generation) latest = report;
         return report;
@@ -59,15 +67,24 @@ function diskWorkspace(inputPaths: readonly string[], trashRoot: string | undefi
 
   return {
     report: scan,
-    async move(worktreePath) {
+    async move(worktreePath, confirmed) {
       if (!latest) throw new HttpError(400, "Scan before moving generated folders to Trash.");
+      generation += 1;
       let result: TrashResult;
       try {
-        result = await moveGeneratedDirectories(latest, worktreePath, trashRoot === undefined ? {} : { trashRoot });
+        result = await moveOnDisk(latest, worktreePath, confirmed);
       } finally {
         generation += 1;
       }
-      return { result, report: await scan() };
+      try {
+        return { result, report: await scan() };
+      } catch (error) {
+        const moved = result.moved.length;
+        throw new HttpError(
+          500,
+          `Moved ${moved} ${moved === 1 ? "folder" : "folders"} to Trash, but the rescan failed: ${error instanceof Error ? error.message : "unknown error"}`,
+        );
+      }
     },
   };
 }
@@ -76,8 +93,8 @@ function demoWorkspace(initial: ScanReport): Workspace {
   let latest = initial;
   return {
     report: async () => ({ ...latest, scannedAt: Date.now() }),
-    async move(worktreePath) {
-      const simulated = simulateMove(latest, worktreePath);
+    async move(worktreePath, confirmed) {
+      const simulated = simulateMove(latest, worktreePath, confirmed);
       latest = simulated.report;
       return simulated;
     },
@@ -85,13 +102,27 @@ function demoWorkspace(initial: ScanReport): Workspace {
 }
 
 function parseMoveRequest(value: unknown): MoveRequest {
-  if (value && typeof value === "object" && "worktreePath" in value && typeof value.worktreePath === "string")
-    return { worktreePath: value.worktreePath };
-  throw new HttpError(400, "Provide the selected worktree path.");
+  if (!value || typeof value !== "object" || !("worktreePath" in value) || typeof value.worktreePath !== "string")
+    throw new HttpError(400, "Provide the selected worktree path.");
+  if (!("directories" in value) || value.directories === undefined) return { worktreePath: value.worktreePath };
+  const { directories } = value;
+  if (!Array.isArray(directories) || !directories.every((directory) => typeof directory === "string"))
+    throw new HttpError(400, "`directories` must be a list of paths.");
+  return { worktreePath: value.worktreePath, directories };
 }
 
 export function startServer(inputPaths: readonly string[], options: ServerOptions = {}): LocalServer {
-  const workspace = options.demo ? demoWorkspace(options.demo) : diskWorkspace(inputPaths, options.trashRoot);
+  const { trashRoot } = options;
+  const workspace = options.demo
+    ? demoWorkspace(options.demo)
+    : diskWorkspace(
+        () => scanWorkspace(inputPaths),
+        (report, worktreePath, confirmed) =>
+          moveGeneratedDirectories(report, worktreePath, {
+            ...(trashRoot === undefined ? {} : { trashRoot }),
+            ...(confirmed === undefined ? {} : { confirmed }),
+          }),
+      );
   const mutationToken = crypto.randomUUID();
 
   // The page is public code, but the API reads your file paths and moves folders. Requiring our own Host
@@ -129,7 +160,8 @@ export function startServer(inputPaths: readonly string[], options: ServerOption
           const body: unknown = await request.json().catch(() => {
             throw new HttpError(400, "Request body must be JSON.");
           });
-          return { ...(await workspace.move(parseMoveRequest(body).worktreePath)), mutationToken };
+          const { worktreePath, directories } = parseMoveRequest(body);
+          return { ...(await workspace.move(worktreePath, directories)), mutationToken };
         }),
       },
     },

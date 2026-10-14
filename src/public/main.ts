@@ -49,7 +49,7 @@ const state: {
   descending: boolean;
   ambiguous: ReadonlySet<string>;
   firstPaint: boolean;
-  busy: boolean;
+  confirming: MoveTarget | undefined;
 } = {
   report: undefined,
   mutationToken: undefined,
@@ -58,8 +58,15 @@ const state: {
   descending: true,
   ambiguous: new Set(),
   firstPaint: true,
-  busy: false,
+  confirming: undefined,
 };
+
+/** What the confirmation dialog listed, so the move acts on exactly that even if a rescan lands first. */
+interface MoveTarget {
+  path: string;
+  branch: string;
+  directories: string[];
+}
 
 const visibleRecords = (): WorktreeRecord[] =>
   filterRecords(state.report?.worktrees ?? [], {
@@ -81,10 +88,21 @@ function showError(error: unknown, fallback: string): void {
   ui.error.hidden = false;
 }
 
-function setBusy(busy: boolean): void {
-  state.busy = busy;
-  ui.refresh.disabled = busy;
-  ui.refresh.classList.toggle("is-loading", busy);
+// Scans and moves run one at a time, in order. A move confirmed during a rescan waits for it rather than
+// being dropped, and a scan requested while another is pending joins that one.
+let queue: Promise<void> = Promise.resolve();
+let queued = 0;
+let pendingScan: Promise<void> | undefined;
+
+function enqueue(task: () => Promise<void>): Promise<void> {
+  queued += 1;
+  ui.refresh.classList.add("is-loading");
+  const run = queue.then(task).finally(() => {
+    queued -= 1;
+    if (queued === 0) ui.refresh.classList.remove("is-loading");
+  });
+  queue = run.catch(() => undefined);
+  return run;
 }
 
 function render(report: ScanReport): void {
@@ -149,32 +167,38 @@ function select(record: WorktreeRecord): void {
   renderInspector(ui.inspector, record, state.ambiguous, openConfirmation);
 }
 
-async function scan(): Promise<void> {
-  if (state.busy) return;
-  setBusy(true);
-  ui.status.textContent = state.report ? "Rescanning…" : "Scanning…";
-  ui.error.hidden = true;
-  try {
-    const { report, mutationToken } = await fetchReport();
-    state.mutationToken = mutationToken;
-    render(report);
-    ui.status.textContent = `Scanned ${formatTime(report.scannedAt)}`;
-  } catch (error) {
-    showError(error, "The scan failed.");
-    ui.status.textContent = "Scan failed";
-  } finally {
-    setBusy(false);
-  }
+function scan(): Promise<void> {
+  pendingScan ??= enqueue(async () => {
+    ui.status.textContent = state.report ? "Rescanning…" : "Scanning…";
+    ui.error.hidden = true;
+    try {
+      const { report, mutationToken } = await fetchReport();
+      state.mutationToken = mutationToken;
+      render(report);
+      ui.status.textContent = `Scanned ${formatTime(report.scannedAt)}`;
+    } catch (error) {
+      showError(error, "The scan failed.");
+      ui.status.textContent = "Scan failed";
+    }
+  }).finally(() => {
+    pendingScan = undefined;
+  });
+  return pendingScan;
 }
 
 function openConfirmation(): void {
   const record = selected();
   if (!record) return;
+  state.confirming = {
+    path: record.path,
+    branch: record.branch,
+    directories: record.generatedDirectories.map((directory) => directory.path),
+  };
   ui.confirmDescription.textContent = `From ${record.branch}. They go to ~/.Trash/Worktree Diet, so you can put them back if you need to.`;
   ui.confirmList.innerHTML = record.generatedDirectories
     .map(
       (directory) =>
-        `<li><code>${escapeHtml(folderLabel(record, directory.path))}</code><span>${formatBytes(directory.allocatedBytes)}</span></li>`,
+        `<li><code>${escapeHtml(folderLabel(record.path, directory.path))}</code><span>${formatBytes(directory.allocatedBytes)}</span></li>`,
     )
     .join("");
   ui.confirmMove.textContent = `Move ${formatBytes(record.generatedAllocatedBytes)} to Trash`;
@@ -182,36 +206,35 @@ function openConfirmation(): void {
   ui.dialog.showModal();
 }
 
-async function moveSelected(): Promise<void> {
-  const record = selected();
-  if (!record || !state.mutationToken || state.busy) return;
-  setBusy(true);
-  ui.confirmMove.disabled = true;
+async function move(target: MoveTarget): Promise<void> {
+  if (!state.mutationToken) return;
+  ui.status.textContent = "Moving to Trash…";
   ui.error.hidden = true;
   try {
-    const { report, mutationToken, result } = await moveToTrash(record.path, state.mutationToken);
+    const { report, mutationToken, result } = await moveToTrash(target.path, target.directories, state.mutationToken);
     state.mutationToken = mutationToken;
     render(report);
+    ui.status.textContent = `Scanned ${formatTime(report.scannedAt)}`;
     // Report what the server actually moved: scanned sizes describe intent, not outcome.
     const skipped = result.warnings.length
-      ? ` Skipped ${result.warnings.map((warning) => `${folderLabel(record, warning.path)} (${warning.message})`).join(", ")}.`
+      ? ` Skipped ${result.warnings.map((warning) => `${folderLabel(target.path, warning.path)} (${warning.message})`).join(", ")}.`
       : "";
-    if (result.moved.length === 0) showNotice(`Nothing moved from ${record.branch}.${skipped}`, "warning");
+    if (result.moved.length === 0) showNotice(`Nothing moved from ${target.branch}.${skipped}`, "warning");
     else
       showNotice(
-        `Moved ${plural(result.moved.length, "folder")} from ${record.branch} to Trash.${skipped}`,
+        `Moved ${plural(result.moved.length, "folder")} from ${target.branch} to Trash.${skipped}`,
         result.warnings.length ? "warning" : "success",
       );
   } catch (error) {
     showError(error, "Unable to move folders to Trash.");
-  } finally {
-    setBusy(false);
-    ui.confirmMove.disabled = false;
+    ui.status.textContent = "Move failed";
   }
 }
 
 ui.dialog.addEventListener("close", () => {
-  if (ui.dialog.returnValue === "confirm") void moveSelected();
+  const target = state.confirming;
+  state.confirming = undefined;
+  if (ui.dialog.returnValue === "confirm" && target) void enqueue(() => move(target));
 });
 ui.refresh.addEventListener("click", () => void scan());
 let searchFrame = 0;

@@ -2,6 +2,7 @@ import {
   activityFor,
   buildReport,
   type CategorySizes,
+  foldersToMove,
   type GeneratedDirectory,
   generatedCategory,
   type ScanReport,
@@ -195,32 +196,43 @@ export function createDemoReport(options: { worktreeCount?: number } = {}): Scan
   return buildReport([HOME], repositories, worktrees);
 }
 
-/** Mirrors moveGeneratedDirectories: only worktrees from the latest report, and the result is re-summarised. */
-export function simulateMove(report: ScanReport, worktreePath: string): { result: TrashResult; report: ScanReport } {
+/** Mirrors moveGeneratedDirectories: only worktrees and folders from the latest report, then re-summarised. */
+export function simulateMove(
+  report: ScanReport,
+  worktreePath: string,
+  confirmed?: readonly string[],
+): { result: TrashResult; report: ScanReport } {
   const target = report.worktrees.find((record) => record.path === worktreePath);
   if (!target) throw new Error("That worktree was not returned by the latest scan.");
   const trashPath = "/Users/you/.Trash/Worktree Diet/demo";
-  const moved = target.generatedDirectories.map((directory) => ({
-    from: directory.path,
-    to: `${trashPath}/${directory.name}`,
-  }));
-  const sizes = { ...emptySizes(), sourceOther: target.sizes.sourceOther };
-  const allocatedSizes = { ...emptySizes(), sourceOther: target.allocatedSizes.sourceOther };
+  const { folders, warnings } = foldersToMove(target, confirmed);
+  const sizes = { ...target.sizes };
+  const allocatedSizes = { ...target.allocatedSizes };
+  for (const folder of folders) {
+    sizes[folder.category] -= folder.logicalBytes;
+    allocatedSizes[folder.category] -= folder.allocatedBytes;
+  }
+  const generatedBytes = sizes.dependencies + sizes.buildOutput + sizes.caches;
+  const generatedAllocatedBytes = allocatedSizes.dependencies + allocatedSizes.buildOutput + allocatedSizes.caches;
   const base = {
     ...target,
     sizes,
     allocatedSizes,
-    totalBytes: sizes.sourceOther,
-    allocatedBytes: allocatedSizes.sourceOther,
-    generatedBytes: 0,
-    generatedAllocatedBytes: 0,
-    generatedDirectories: [],
+    totalBytes: generatedBytes + sizes.sourceOther,
+    allocatedBytes: generatedAllocatedBytes + allocatedSizes.sourceOther,
+    generatedBytes,
+    generatedAllocatedBytes,
+    generatedDirectories: target.generatedDirectories.filter((directory) => !folders.includes(directory)),
   };
   const worktrees = report.worktrees.map((record) =>
     record === target ? { ...base, activity: activityFor(base) } : record,
   );
   return {
-    result: { moved, warnings: [], trashPath },
+    result: {
+      moved: folders.map((folder, index) => ({ from: folder.path, to: `${trashPath}/${index}-${folder.name}` })),
+      warnings,
+      trashPath,
+    },
     report: buildReport(report.roots, report.repositories, worktrees),
   };
 }

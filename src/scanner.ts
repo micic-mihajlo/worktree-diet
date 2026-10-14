@@ -253,7 +253,8 @@ function addToTally(claim: Omit<Claim, "path">): void {
 /**
  * Hardlinked files (pnpm stores, shared caches) are counted once per scan, for the alphabetically first
  * path that links to them. Deciding after traversal keeps sizes identical between scans however the
- * parallel walk happens to be ordered. Files with a single link can't be double-counted, so they skip this.
+ * parallel walk happens to be ordered. Every directory is walked by exactly one worktree (each walk
+ * excludes all other worktree roots), so a file with a single link is reached once and skips this.
  */
 class HardlinkLedger {
   readonly #claims = new Map<string, Claim>();
@@ -299,7 +300,19 @@ async function measureWorktree(
         }
         if (entry.isDirectory()) {
           if (entry.name === ".git" || excludedRoots.has(path)) return;
-          const childCategory = category === "sourceOther" ? generatedCategory(entry.name) : category;
+          let childCategory = category === "sourceOther" ? generatedCategory(entry.name) : category;
+          const nested =
+            category === "sourceOther" && childCategory !== "sourceOther"
+              ? [...excludedRoots].find((root) => isInside(path, root))
+              : undefined;
+          if (nested) {
+            // Moving this folder would carry another worktree, and its uncommitted work, into Trash.
+            warnings.push({
+              path,
+              message: `Not treated as generated because it contains the worktree ${nested}`,
+            });
+            childCategory = "sourceOther";
+          }
           if (category === "sourceOther" && childCategory !== "sourceOther") {
             // Only the outermost generated folder is listed; everything below it belongs to it.
             const folder: GeneratedDirectory = {
@@ -341,16 +354,17 @@ async function measureWorktree(
   return { ...tally, generatedDirectories, warnings };
 }
 
-async function repositoryIdentity(path: string, git: Limit): Promise<Repository | undefined> {
+async function repositoryIdentity(path: string, git: Limit): Promise<Repository | { error: string }> {
   const [common, topLevel] = await Promise.all([
     git(() => runGit(["rev-parse", "--git-common-dir"], path)),
     git(() => runGit(["rev-parse", "--show-toplevel"], path)),
   ]);
-  if (!common.ok || !topLevel.ok) return undefined;
+  if (!common.ok) return { error: common.error };
+  if (!topLevel.ok) return { error: topLevel.error };
   try {
     return { id: await realpath(resolve(path, common.output.trim())), path: await realpath(topLevel.output.trim()) };
-  } catch {
-    return undefined;
+  } catch (error) {
+    return { error: errorMessage(error) };
   }
 }
 
@@ -395,36 +409,29 @@ async function discoverRepositoryPaths(
   };
   await visit(root, 0);
   // A path inside a repository (rather than a parent of repositories) still counts.
-  if (paths.length === 0 && (await repositoryIdentity(root, git))) paths.push(root);
+  if (paths.length === 0 && "id" in (await repositoryIdentity(root, git))) paths.push(root);
   return { paths: paths.sort(), warnings };
 }
 
-interface PendingWorktree {
+interface ListedRepository {
   repository: Repository;
-  path: string;
-  branch: string;
-  measurement: Promise<Measurement>;
-  status: Promise<GitResult>;
-  lastCommit: Promise<GitResult>;
+  worktrees: { path: string; branch: string }[];
+  warnings: ScanWarning[];
 }
 
-/** Lists a repository's worktrees and starts measuring each; missing worktree folders become warnings. */
-async function startRepository(
-  candidate: string,
-  identity: Repository,
-  ledger: HardlinkLedger,
-  io: Limit,
-  git: Limit,
-): Promise<{ repository: Repository; worktrees: PendingWorktree[]; warnings: ScanWarning[] }> {
-  const warnings: ScanWarning[] = [];
+/** Lists a repository's worktrees; folders that no longer exist become warnings. */
+async function listRepository(candidate: string, identity: Repository, git: Limit): Promise<ListedRepository> {
   const listing = await git(() => runGit(["worktree", "list", "--porcelain"], candidate));
-  if (!listing.ok) {
-    warnings.push({ path: candidate, message: `Could not list worktrees: ${listing.error}` });
-    return { repository: identity, worktrees: [], warnings };
-  }
+  if (!listing.ok)
+    return {
+      repository: identity,
+      worktrees: [],
+      warnings: [{ path: candidate, message: `Could not list worktrees: ${listing.error}` }],
+    };
   const listed = parseWorktreeList(listing.output).filter((worktree) => !worktree.bare);
   const resolved = await Promise.allSettled(listed.map((worktree) => realpath(worktree.path)));
-  const worktrees: { path: string; branch: string }[] = [];
+  const worktrees: ListedRepository["worktrees"] = [];
+  const warnings: ScanWarning[] = [];
   for (const [index, result] of resolved.entries()) {
     const worktree = listed[index];
     if (!worktree) continue;
@@ -436,24 +443,16 @@ async function startRepository(
       });
   }
   // Git lists the main worktree first, so it names the repository.
-  const repository = { ...identity, path: worktrees[0]?.path ?? identity.path };
-  const roots = new Set(worktrees.map((worktree) => worktree.path));
-  return {
-    repository,
-    warnings,
-    worktrees: worktrees.map((worktree) => {
-      // Linked worktrees can sit inside the main one; each is measured on its own, never as part of another.
-      const excluded = new Set(roots);
-      excluded.delete(worktree.path);
-      return {
-        repository,
-        ...worktree,
-        measurement: measureWorktree(worktree.path, excluded, ledger, io),
-        status: git(() => runGit(["status", "--porcelain"], worktree.path)),
-        lastCommit: git(() => runGit(["log", "-1", "--format=%ct"], worktree.path)),
-      };
-    }),
-  };
+  return { repository: { ...identity, path: worktrees[0]?.path ?? identity.path }, worktrees, warnings };
+}
+
+interface PendingWorktree {
+  repository: Repository;
+  path: string;
+  branch: string;
+  measurement: Promise<Measurement>;
+  status: Promise<GitResult>;
+  lastCommit: Promise<GitResult>;
 }
 
 async function finishWorktree(pending: PendingWorktree): Promise<WorktreeRecord> {
@@ -496,14 +495,32 @@ export async function scanWorkspace(inputPaths: readonly string[]): Promise<Scan
   const unique = new Map<string, { candidate: string; identity: Repository }>();
   for (const [index, identity] of identities.entries()) {
     const candidate = candidates[index];
-    if (identity && candidate && !unique.has(identity.id)) unique.set(identity.id, { candidate, identity });
+    if (!candidate) continue;
+    if ("error" in identity)
+      warnings.push({ path: candidate, message: `Could not read this repository: ${identity.error}` });
+    else if (!unique.has(identity.id)) unique.set(identity.id, { candidate, identity });
   }
 
-  const ledger = new HardlinkLedger();
-  const started = await Promise.all(
-    [...unique.values()].map(({ candidate, identity }) => startRepository(candidate, identity, ledger, io, git)),
+  const listed = await Promise.all(
+    [...unique.values()].map(({ candidate, identity }) => listRepository(candidate, identity, git)),
   );
-  const pending = started.flatMap((repository) => repository.worktrees);
+  // Every walk skips every other worktree root, from any repository, so each directory is measured once
+  // and a worktree nested inside another (or inside another repository) is never counted twice.
+  const allRoots = new Set(listed.flatMap((repository) => repository.worktrees.map((worktree) => worktree.path)));
+  const ledger = new HardlinkLedger();
+  const pending: PendingWorktree[] = listed.flatMap(({ repository, worktrees }) =>
+    worktrees.map((worktree) => {
+      const excluded = new Set(allRoots);
+      excluded.delete(worktree.path);
+      return {
+        repository,
+        ...worktree,
+        measurement: measureWorktree(worktree.path, excluded, ledger, io),
+        status: git(() => runGit(["status", "--porcelain"], worktree.path)),
+        lastCommit: git(() => runGit(["log", "-1", "--format=%ct"], worktree.path)),
+      };
+    }),
+  );
   // Every file must be seen before hardlinks are settled, so wait for all measurements first.
   await Promise.all(pending.map((worktree) => worktree.measurement));
   ledger.settle();
@@ -512,9 +529,9 @@ export async function scanWorkspace(inputPaths: readonly string[]): Promise<Scan
   for (const record of await Promise.all(pending.map(finishWorktree))) records.set(record.path, record);
   return buildReport(
     roots,
-    started.map((repository) => repository.repository).sort((left, right) => left.path.localeCompare(right.path)),
+    listed.map((repository) => repository.repository).sort((left, right) => left.path.localeCompare(right.path)),
     [...records.values()],
-    [...warnings, ...started.flatMap((repository) => repository.warnings)],
+    [...warnings, ...listed.flatMap((repository) => repository.warnings)],
   );
 }
 
@@ -558,15 +575,35 @@ function isInside(parent: string, child: string): boolean {
 }
 
 /**
+ * The folders a move acts on: every generated folder the scan found, or, when the user confirmed a
+ * specific list, only those that are also still in the scan. So a folder that appeared after the
+ * confirmation is never moved unseen, and a path the scan didn't produce never is either.
+ */
+export function foldersToMove(
+  worktree: WorktreeRecord,
+  confirmed?: readonly string[],
+): { folders: GeneratedDirectory[]; warnings: ScanWarning[] } {
+  if (!confirmed) return { folders: worktree.generatedDirectories, warnings: [] };
+  const wanted = new Set(confirmed);
+  const scanned = new Set(worktree.generatedDirectories.map((directory) => directory.path));
+  return {
+    folders: worktree.generatedDirectories.filter((directory) => wanted.has(directory.path)),
+    warnings: confirmed
+      .filter((path) => !scanned.has(path))
+      .map((path) => ({ path, message: "Skipped because it is no longer in the latest scan" })),
+  };
+}
+
+/**
  * Moves the generated folders the latest scan found in one worktree into a fresh Trash folder.
- * Paths come only from the report, and each is re-checked first: still a real directory, still inside
- * the worktree, and still at the same canonical path, so a parent swapped for a symlink since the scan
- * can't redirect the move elsewhere.
+ * Paths come only from the report, and each is re-checked first: inside the worktree, holding no other
+ * worktree, still a real directory, and still at the same canonical path, so a parent swapped for a
+ * symlink since the scan can't redirect the move elsewhere.
  */
 export async function moveGeneratedDirectories(
   report: ScanReport,
   worktreePath: string,
-  options: { trashRoot?: string } = {},
+  options: { trashRoot?: string; confirmed?: readonly string[] } = {},
 ): Promise<TrashResult> {
   const notScanned = new Error("That worktree was not returned by the latest scan.");
   let canonicalWorktreePath: string;
@@ -584,11 +621,18 @@ export async function moveGeneratedDirectories(
   const moved: TrashResult["moved"] = [];
   const warnings: ScanWarning[] = [];
   const skip = (path: string, message: string) => warnings.push({ path, message });
+  const { folders, warnings: unavailable } = foldersToMove(worktree, options.confirmed);
+  warnings.push(...unavailable);
 
-  for (const directory of worktree.generatedDirectories) {
+  for (const directory of folders) {
     try {
       if (!isInside(worktree.path, directory.path)) {
         skip(directory.path, "Skipped because it is outside the scanned worktree");
+        continue;
+      }
+      const nested = report.worktrees.find((other) => isInside(directory.path, other.path));
+      if (nested) {
+        skip(directory.path, `Skipped because it contains the worktree ${nested.path}`);
         continue;
       }
       const current = await lstat(directory.path);

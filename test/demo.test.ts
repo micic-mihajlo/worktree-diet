@@ -34,6 +34,19 @@ describe("demo mode", () => {
     expect(() => simulateMove(report, "/elsewhere")).toThrow("latest scan");
   });
 
+  test("simulated moves of confirmed folders free only those folders", () => {
+    const report = createDemoReport();
+    const target = report.worktrees.find((record) => record.generatedDirectories.length > 1);
+    const [kept, moved] = target?.generatedDirectories ?? [];
+    if (!target || !kept || !moved) throw new Error("The demo needs a worktree with several generated folders");
+    const { result, report: next } = simulateMove(report, target.path, [moved.path, "/not/scanned"]);
+    expect(result.moved.map((move) => move.from)).toEqual([moved.path]);
+    expect(result.warnings.map((warning) => warning.path)).toEqual(["/not/scanned"]);
+    const after = next.worktrees.find((record) => record.path === target.path);
+    expect(after?.generatedDirectories.map((directory) => directory.path)).toEqual([kept.path]);
+    expect(after?.generatedAllocatedBytes).toBe(target.generatedAllocatedBytes - moved.allocatedBytes);
+  });
+
   test("serves the demo report and simulates moves through the token-guarded endpoint", async () => {
     const server = startServer([], { demo: createDemoReport() });
     try {

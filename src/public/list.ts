@@ -34,6 +34,8 @@ export class WorktreeList {
     this.#largest = Math.max(1, ...records.map((record) => record.generatedAllocatedBytes));
     this.#selected = selectedPath;
     this.#tabStop = undefined;
+    // The previous report's rows go now; `show` would otherwise leave them on screen when nothing new is shown.
+    this.#list.replaceChildren();
     this.#rows = new Map(records.map((record) => [record.path, this.#buildRow(record, ambiguous)]));
   }
 

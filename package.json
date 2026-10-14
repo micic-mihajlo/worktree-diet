@@ -17,6 +17,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2",
+    "@happy-dom/global-registrator": "^21.0.1",
     "@types/bun": "latest",
     "typescript": "latest"
   }

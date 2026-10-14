@@ -12,6 +12,11 @@ export interface ReportResponse {
 /** POST /api/move-to-trash with a `MoveRequest` body and the token header. */
 export interface MoveRequest {
   worktreePath: string;
+  /**
+   * The folders the user confirmed. Only those that are also in the server's latest scan move, so nothing
+   * that appeared since is moved unseen. Omit to move every generated folder the scan found.
+   */
+  directories?: string[];
 }
 export interface MoveResponse extends ReportResponse {
   result: TrashResult;

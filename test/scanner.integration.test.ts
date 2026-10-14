@@ -211,6 +211,95 @@ describe("workspace scanner", () => {
     expect(result.warnings).toHaveLength(1);
     expect(await readdir(trash)).toEqual([]);
   });
+  test("counts a worktree nested inside another repository once", async () => {
+    const parent = await temporaryDirectory("worktree-diet-parent-");
+    const a = join(parent, "A");
+    const b = join(parent, "B");
+    for (const path of [a, b]) {
+      await mkdir(path);
+      await git(path, "init");
+      await git(path, "-c", "user.email=a@b.c", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init");
+    }
+    await git(a, "worktree", "add", "-b", "nested", join(b, "wt-a"));
+    await mkdir(join(b, "wt-a", "node_modules"));
+    await writeFile(join(b, "wt-a", "node_modules", "package.bin"), "x".repeat(10_000));
+    const report = await scanWorkspace([parent]);
+    expect(report.generatedBytes).toBe(10_000);
+    const ownerOf = (directory: string) =>
+      report.worktrees.filter((worktree) => worktree.generatedDirectories.some((d) => d.path.endsWith(directory)));
+    expect(ownerOf("wt-a/node_modules").map((worktree) => worktree.branch)).toEqual(["nested"]);
+  });
+  test("never offers a generated folder that contains another worktree", async () => {
+    const { root } = await makeRepository();
+    const hotfix = join(root, "build", "hotfix");
+    await git(root, "worktree", "add", "-b", "hotfix", hotfix);
+    await writeFile(join(hotfix, "uncommitted.txt"), "work in progress");
+    await writeFile(join(root, "build", "output.js"), "built");
+    const report = await scanRepository(root);
+    const main = report.worktrees.find((worktree) => worktree.path === report.repositories[0]?.path);
+    expect(main?.generatedDirectories.map((directory) => directory.name)).not.toContain("build");
+    expect(report.warnings.some((warning) => warning.message.includes("contains the worktree"))).toBe(true);
+
+    // Even if a report did list it, the move refuses rather than carrying the worktree into Trash.
+    const buildPath = join(await realpath(root), "build");
+    const tampered = {
+      ...report,
+      worktrees: report.worktrees.map((worktree) =>
+        worktree === main
+          ? {
+              ...worktree,
+              generatedDirectories: [
+                {
+                  path: buildPath,
+                  name: "build",
+                  category: "buildOutput" as const,
+                  logicalBytes: 5,
+                  allocatedBytes: 5,
+                },
+              ],
+            }
+          : worktree,
+      ),
+    };
+    const trashRoot = await temporaryDirectory("worktree-diet-trash-");
+    const result = await moveGeneratedDirectories(tampered, root, { trashRoot });
+    expect(result.moved).toEqual([]);
+    expect(result.warnings[0]?.message).toContain("contains the worktree");
+    expect(await Bun.file(join(hotfix, "uncommitted.txt")).text()).toBe("work in progress");
+  });
+  test("warns about a repository Git cannot read instead of silently dropping it", async () => {
+    const parent = await temporaryDirectory("worktree-diet-parent-");
+    const healthy = await makeRepository(parent);
+    const broken = join(parent, "broken");
+    await mkdir(broken);
+    await writeFile(join(broken, ".git"), "gitdir: /nonexistent/worktree\n");
+    const report = await scanWorkspace([parent]);
+    expect(report.repositories.map((repository) => repository.path)).toEqual([await realpath(healthy.root)]);
+    expect(
+      report.warnings.some(
+        (warning) => warning.path === broken && warning.message.startsWith("Could not read this repository"),
+      ),
+    ).toBe(true);
+  });
+  test("moves only the confirmed folders that are still in the scan", async () => {
+    const { root } = await makeRepository();
+    for (const name of ["dist", "node_modules"]) {
+      await mkdir(join(root, name));
+      await writeFile(join(root, name, "file"), name);
+    }
+    const report = await scanRepository(root);
+    const canonical = await realpath(root);
+    const trashRoot = await temporaryDirectory("worktree-diet-trash-");
+    const result = await moveGeneratedDirectories(report, root, {
+      trashRoot,
+      confirmed: [join(canonical, "dist"), join(canonical, ".next")],
+    });
+    expect(result.moved.map((move) => move.from)).toEqual([join(canonical, "dist")]);
+    expect(result.warnings).toEqual([
+      { path: join(canonical, ".next"), message: "Skipped because it is no longer in the latest scan" },
+    ]);
+    expect(await Bun.file(join(root, "node_modules", "file")).text()).toBe("node_modules");
+  });
   test("returns a useful error for non-Git input", async () => {
     const path = await temporaryDirectory("worktree-diet-not-git-");
     await expect(scanRepository(path)).rejects.toThrow("Not a Git repository");

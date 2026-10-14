@@ -21,9 +21,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const fetchReport = (): Promise<ReportResponse> => request("/api/report");
 
-export const moveToTrash = (worktreePath: string, mutationToken: string): Promise<MoveResponse> =>
+/** Moves the confirmed `directories` of a worktree; the server only moves those still in its latest scan. */
+export const moveToTrash = (
+  worktreePath: string,
+  directories: string[],
+  mutationToken: string,
+): Promise<MoveResponse> =>
   request("/api/move-to-trash", {
     method: "POST",
     headers: { "content-type": "application/json", [MUTATION_TOKEN_HEADER]: mutationToken },
-    body: JSON.stringify({ worktreePath } satisfies MoveRequest),
+    body: JSON.stringify({ worktreePath, directories } satisfies MoveRequest),
   });

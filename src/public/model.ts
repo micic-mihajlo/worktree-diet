@@ -60,8 +60,8 @@ export const locationLine = (record: WorktreeRecord, ambiguous: ReadonlySet<stri
   ambiguous.has(record.path) ? record.path : shortLocation(record);
 
 /** Nested generated folders can share a name (packages/web/dist, packages/docs/dist), so show where each lives. */
-export const folderLabel = (record: WorktreeRecord, path: string): string =>
-  path.startsWith(`${record.path}/`) ? path.slice(record.path.length + 1) : baseName(path);
+export const folderLabel = (worktreePath: string, path: string): string =>
+  path.startsWith(`${worktreePath}/`) ? path.slice(worktreePath.length + 1) : baseName(path);
 
 /** One sentence explaining the recommendation, from the cause the scanner reported. */
 export function verdict(record: WorktreeRecord, now = Date.now()): string {

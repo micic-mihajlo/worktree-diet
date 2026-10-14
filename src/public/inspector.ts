@@ -32,7 +32,7 @@ export function renderInspector(
             : "";
         return `
       <li title="${escapeHtml(directory.path)}">
-        <code>${escapeHtml(folderLabel(record, directory.path))}</code><small>${categoryLabels[directory.category]}</small><span>${formatBytes(directory.allocatedBytes)}</span>
+        <code>${escapeHtml(folderLabel(record.path, directory.path))}</code><small>${categoryLabels[directory.category]}</small><span>${formatBytes(directory.allocatedBytes)}</span>
         ${bar}
       </li>`;
       })

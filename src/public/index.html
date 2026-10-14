@@ -86,12 +86,12 @@
 
   <dialog id="confirm-dialog" aria-labelledby="confirm-title">
     <form method="dialog">
-      <span class="dialog-icon" aria-hidden="true"><svg viewBox="0 0 20 20"><path d="M4 6h12M8 6V4.5h4V6M5.5 6l.8 10h7.4l.8-10M8.5 9v4.5M11.5 9v4.5"></path></svg></span>
+      <span class="dialog-icon" aria-hidden="true"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M4 6h12M8 6V4.5h4V6M5.5 6l.8 10h7.4l.8-10M8.5 9v4.5M11.5 9v4.5"></path></svg></span>
       <h2 id="confirm-title">Move generated folders to Trash?</h2>
       <p id="confirm-description"></p>
       <ul id="confirm-list"></ul>
       <div class="dialog-actions">
-        <button value="cancel">Cancel</button>
+        <button type="submit" value="cancel">Cancel</button>
         <button id="confirm-move" value="confirm" class="primary" type="submit"></button>
       </div>
     </form>

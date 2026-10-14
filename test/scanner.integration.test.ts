@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { link, mkdir, mkdtemp, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { link, mkdir, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
   activityFor,
@@ -10,32 +9,9 @@ import {
   scanRepository,
   scanWorkspace,
 } from "../src/scanner.ts";
+import { cleanTemporaryRoots, git, makeRepository, temporaryDirectory } from "./helpers.ts";
 
-const temporaryRoots: string[] = [];
-async function git(cwd: string, ...args: string[]): Promise<void> {
-  const process = Bun.spawn(["git", "-C", cwd, ...args], { stdout: "pipe", stderr: "pipe" });
-  const [code, stderr] = await Promise.all([process.exited, new Response(process.stderr).text()]);
-  if (code !== 0) throw new Error(stderr);
-}
-async function makeRepository(parent?: string): Promise<{ root: string; linked: string }> {
-  const root = parent
-    ? join(parent, `repository-${crypto.randomUUID()}`)
-    : await mkdtemp(join(tmpdir(), "worktree-diet-"));
-  if (!parent) temporaryRoots.push(root);
-  else await mkdir(root, { recursive: true });
-  await git(root, "init");
-  await git(root, "config", "user.email", "diet@example.test");
-  await git(root, "config", "user.name", "Diet Test");
-  await writeFile(join(root, "README.md"), "main\n");
-  await git(root, "add", "README.md");
-  await git(root, "commit", "-m", "initial");
-  const linked = join(root, "feature worktree");
-  await git(root, "worktree", "add", "-b", "feature", linked);
-  return { root, linked };
-}
-afterEach(async () => {
-  await Promise.all(temporaryRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })));
-});
+afterEach(cleanTemporaryRoots);
 
 describe("workspace scanner", () => {
   test("discovers linked worktrees, classifies real files, and reports dirty state", async () => {
@@ -62,8 +38,7 @@ describe("workspace scanner", () => {
     ).toContain("node_modules");
   });
   test("discovers repositories from multiple parents and deduplicates shared worktrees", async () => {
-    const parent = await mkdtemp(join(tmpdir(), "worktree-diet-parent-"));
-    temporaryRoots.push(parent);
+    const parent = await temporaryDirectory("worktree-diet-parent-");
     const first = await makeRepository(parent);
     const second = await makeRepository(parent);
     await mkdir(join(first.linked, "dist"));
@@ -75,8 +50,7 @@ describe("workspace scanner", () => {
     expect(report.generatedBytes).toBe("generated".length);
   });
   test("prefers repositories inside a parent directory even when that parent sits in another repository", async () => {
-    const outer = await mkdtemp(join(tmpdir(), "worktree-diet-outer-"));
-    temporaryRoots.push(outer);
+    const outer = await temporaryDirectory("worktree-diet-outer-");
     await git(outer, "init");
     const parent = join(outer, "repositories");
     await mkdir(parent);
@@ -154,8 +128,7 @@ describe("workspace scanner", () => {
   });
   test("moves only scanned generated directories to a temporary Trash root", async () => {
     const { root } = await makeRepository();
-    const trash = await mkdtemp(join(tmpdir(), "worktree-diet-trash-"));
-    temporaryRoots.push(trash);
+    const trash = await temporaryDirectory("worktree-diet-trash-");
     await mkdir(join(root, "dist"));
     await writeFile(join(root, "dist", "bundle"), "artifact");
     await writeFile(join(root, "keep.txt"), "source");
@@ -168,8 +141,7 @@ describe("workspace scanner", () => {
   });
   test("rejects an unscanned worktree path at the trash boundary", async () => {
     const { root } = await makeRepository();
-    const outside = await mkdtemp(join(tmpdir(), "worktree-diet-outside-"));
-    temporaryRoots.push(outside);
+    const outside = await temporaryDirectory("worktree-diet-outside-");
     await mkdir(join(root, "dist"));
     await writeFile(join(root, "dist", "bundle"), "artifact");
     const report = await scanRepository(root);
@@ -214,8 +186,7 @@ describe("workspace scanner", () => {
   });
   test("skips a folder whose parent was swapped for a symlink after the scan", async () => {
     const { root } = await makeRepository();
-    const outside = await mkdtemp(join(tmpdir(), "worktree-diet-outside-"));
-    temporaryRoots.push(outside);
+    const outside = await temporaryDirectory("worktree-diet-outside-");
     await mkdir(join(root, "packages", "app", "dist"), { recursive: true });
     await writeFile(join(root, "packages", "app", "dist", "bundle"), "inside");
     const report = await scanRepository(root);
@@ -230,8 +201,7 @@ describe("workspace scanner", () => {
   });
   test("creates no Trash folder when nothing is moved", async () => {
     const { root } = await makeRepository();
-    const trash = await mkdtemp(join(tmpdir(), "worktree-diet-trash-"));
-    temporaryRoots.push(trash);
+    const trash = await temporaryDirectory("worktree-diet-trash-");
     await mkdir(join(root, "dist"));
     await writeFile(join(root, "dist", "bundle"), "artifact");
     const report = await scanRepository(root);
@@ -242,8 +212,7 @@ describe("workspace scanner", () => {
     expect(await readdir(trash)).toEqual([]);
   });
   test("returns a useful error for non-Git input", async () => {
-    const path = await mkdtemp(join(tmpdir(), "worktree-diet-not-git-"));
-    temporaryRoots.push(path);
+    const path = await temporaryDirectory("worktree-diet-not-git-");
     await expect(scanRepository(path)).rejects.toThrow("Not a Git repository");
   });
 });

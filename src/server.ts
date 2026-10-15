@@ -1,65 +1,171 @@
-import { join } from "node:path";
 import { simulateMove } from "./demo.ts";
-import { moveGeneratedDirectories, scanWorkspace, type ScanReport } from "./scanner.ts";
+import {
+  type ErrorResponse,
+  type MoveRequest,
+  type MoveResponse,
+  MUTATION_TOKEN_HEADER,
+  type ReportResponse,
+} from "./protocol.ts";
+import index from "./public/index.html";
+import { moveGeneratedDirectories, type ScanReport, scanWorkspace, type TrashResult } from "./scanner.ts";
 
-const publicDirectory = join(import.meta.dir, "public");
-const assets: Record<string, string> = {
-  "/": "index.html",
-  "/app.js": "app.js",
-  "/styles.css": "styles.css",
-  "/fonts/Geist-Variable.woff2": "fonts/Geist-Variable.woff2",
-  "/fonts/GeistMono-Variable.woff2": "fonts/GeistMono-Variable.woff2",
-  "/fonts/GeistPixel-Square.woff2": "fonts/GeistPixel-Square.woff2",
-  "/fonts/LICENSE.txt": "fonts/LICENSE.txt",
-};
-const contentTypes: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".woff2": "font/woff2", ".txt": "text/plain; charset=utf-8" };
-export interface LocalServer { url: string; stop(): void; }
+export interface LocalServer {
+  url: string;
+  stop(): void;
+}
 /** `demo` replaces scanning with an in-memory report; moves are simulated and never touch disk. */
-export interface ServerOptions { port?: number; trashRoot?: string; demo?: ScanReport; }
+export interface ServerOptions {
+  port?: number;
+  trashRoot?: string;
+  demo?: ScanReport;
+}
 
-function parseMoveRequest(value: unknown): { worktreePath: string } | undefined {
-  if (!value || typeof value !== "object" || !("worktreePath" in value) || typeof value.worktreePath !== "string") return undefined;
-  return { worktreePath: value.worktreePath };
+/** Where reports come from and how moves happen: the real disk, or the in-memory demo. */
+export interface Workspace {
+  report(): Promise<ScanReport>;
+  move(worktreePath: string, confirmed?: readonly string[]): Promise<{ result: TrashResult; report: ScanReport }>;
+}
+
+export class HttpError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * Scans and moves on disk. Takes its scan and move as functions so the coordination below can be tested
+ * with controlled timing.
+ */
+export function diskWorkspace(
+  scanDisk: () => Promise<ScanReport>,
+  moveOnDisk: (report: ScanReport, worktreePath: string, confirmed?: readonly string[]) => Promise<TrashResult>,
+): Workspace {
+  let latest: ScanReport | undefined;
+  let inFlight: { generation: number; scan: Promise<ScanReport> } | undefined;
+  // Bumped when a move starts and when it ends, so a scan that began before or during a move (and so may
+  // have seen folders half-moved) is returned to its caller but never becomes `latest`.
+  let generation = 0;
+
+  // Concurrent report requests share one scan instead of each walking the disk.
+  const scan = (): Promise<ScanReport> => {
+    if (inFlight?.generation === generation) return inFlight.scan;
+    const startedAt = generation;
+    const scan = scanDisk()
+      .then((report) => {
+        if (startedAt === generation) latest = report;
+        return report;
+      })
+      .finally(() => {
+        if (inFlight?.scan === scan) inFlight = undefined;
+      });
+    inFlight = { generation: startedAt, scan };
+    return scan;
+  };
+
+  return {
+    report: scan,
+    async move(worktreePath, confirmed) {
+      if (!latest) throw new HttpError(400, "Scan before moving generated folders to Trash.");
+      generation += 1;
+      let result: TrashResult;
+      try {
+        result = await moveOnDisk(latest, worktreePath, confirmed);
+      } finally {
+        generation += 1;
+      }
+      try {
+        return { result, report: await scan() };
+      } catch (error) {
+        const moved = result.moved.length;
+        throw new HttpError(
+          500,
+          `Moved ${moved} ${moved === 1 ? "folder" : "folders"} to Trash, but the rescan failed: ${error instanceof Error ? error.message : "unknown error"}`,
+        );
+      }
+    },
+  };
+}
+
+function demoWorkspace(initial: ScanReport): Workspace {
+  let latest = initial;
+  return {
+    report: async () => ({ ...latest, scannedAt: Date.now() }),
+    async move(worktreePath, confirmed) {
+      const simulated = simulateMove(latest, worktreePath, confirmed);
+      latest = simulated.report;
+      return simulated;
+    },
+  };
+}
+
+function parseMoveRequest(value: unknown): MoveRequest {
+  if (!value || typeof value !== "object" || !("worktreePath" in value) || typeof value.worktreePath !== "string")
+    throw new HttpError(400, "Provide the selected worktree path.");
+  if (!("directories" in value) || value.directories === undefined) return { worktreePath: value.worktreePath };
+  const { directories } = value;
+  if (!Array.isArray(directories) || !directories.every((directory) => typeof directory === "string"))
+    throw new HttpError(400, "`directories` must be a list of paths.");
+  return { worktreePath: value.worktreePath, directories };
 }
 
 export function startServer(inputPaths: readonly string[], options: ServerOptions = {}): LocalServer {
-  let latestReport: ScanReport | undefined = options.demo;
+  const { trashRoot } = options;
+  const workspace = options.demo
+    ? demoWorkspace(options.demo)
+    : diskWorkspace(
+        () => scanWorkspace(inputPaths),
+        (report, worktreePath, confirmed) =>
+          moveGeneratedDirectories(report, worktreePath, {
+            ...(trashRoot === undefined ? {} : { trashRoot }),
+            ...(confirmed === undefined ? {} : { confirmed }),
+          }),
+      );
   const mutationToken = crypto.randomUUID();
-  const demo = options.demo !== undefined;
+
+  // The page is public code, but the API reads your file paths and moves folders. Requiring our own Host
+  // stops a DNS-rebinding site from reaching it as if it were same-origin.
+  const api =
+    (handler: (request: Request) => Promise<unknown>) =>
+    async (request: Request): Promise<Response> => {
+      const host = request.headers.get("host");
+      if (host !== `127.0.0.1:${server.port}` && host !== `localhost:${server.port}`)
+        return Response.json({ message: "Unexpected host." } satisfies ErrorResponse, { status: 403 });
+      try {
+        return Response.json(await handler(request));
+      } catch (error) {
+        const status = error instanceof HttpError ? error.status : 422;
+        const message = error instanceof Error ? error.message : "Something went wrong.";
+        return Response.json({ message } satisfies ErrorResponse, { status });
+      }
+    };
+
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: options.port ?? 0,
+    // Scans of large folders can take a while; don't drop the request.
     idleTimeout: 255,
-    async fetch(request) {
-      const url = new URL(request.url);
-      if (url.pathname === "/api/report" && request.method === "GET") {
-        if (demo && latestReport) return Response.json({ state: "complete", report: { ...latestReport, scannedAt: Date.now() }, mutationToken });
-        try {
-          const report = await scanWorkspace(inputPaths); latestReport = report;
-          return Response.json({ state: "complete", report, mutationToken });
-        } catch (error) { return Response.json({ state: "error", message: error instanceof Error ? error.message : "Unable to scan the selected paths", report: latestReport }, { status: 422 }); }
-      }
-      if (url.pathname === "/api/move-to-trash" && request.method === "POST") {
-        if (request.headers.get("x-worktree-diet-token") !== mutationToken) return Response.json({ message: "A valid scan token is required to move generated folders." }, { status: 403 });
-        if (!latestReport) return Response.json({ message: "Scan before moving generated folders to Trash." }, { status: 400 });
-        let body: unknown;
-        try { body = await request.json(); } catch { return Response.json({ message: "Request body must be JSON." }, { status: 400 }); }
-        const parsed = parseMoveRequest(body); if (!parsed) return Response.json({ message: "Provide the selected worktree path." }, { status: 400 });
-        if (demo) {
-          try { const simulated = simulateMove(latestReport, parsed.worktreePath); latestReport = simulated.report; return Response.json({ result: simulated.result, report: simulated.report, mutationToken }); }
-          catch (error) { return Response.json({ message: error instanceof Error ? error.message : "Unable to move generated folders to Trash." }, { status: 422 }); }
-        }
-        try {
-          const result = options.trashRoot === undefined ? await moveGeneratedDirectories(latestReport, parsed.worktreePath) : await moveGeneratedDirectories(latestReport, parsed.worktreePath, { trashRoot: options.trashRoot });
-          const report = await scanWorkspace(inputPaths); latestReport = report;
-          return Response.json({ result, report, mutationToken });
-        } catch (error) { return Response.json({ message: error instanceof Error ? error.message : "Unable to move generated folders to Trash." }, { status: 422 }); }
-      }
-      const asset = assets[url.pathname]; if (!asset) return new Response("Not found", { status: 404 });
-      const file = Bun.file(join(publicDirectory, asset)); if (!await file.exists()) return new Response("Missing application asset", { status: 500 });
-      const extension = asset.slice(asset.lastIndexOf("."));
-      return new Response(file, { headers: { "content-type": contentTypes[extension] ?? "application/octet-stream", "cache-control": "no-store" } });
+    development: false,
+    routes: {
+      "/": index,
+      "/api/report": {
+        GET: api(async (): Promise<ReportResponse> => ({ report: await workspace.report(), mutationToken })),
+      },
+      "/api/move-to-trash": {
+        POST: api(async (request): Promise<MoveResponse> => {
+          if (request.headers.get(MUTATION_TOKEN_HEADER) !== mutationToken)
+            throw new HttpError(403, "A valid scan token is required to move generated folders.");
+          const body: unknown = await request.json().catch(() => {
+            throw new HttpError(400, "Request body must be JSON.");
+          });
+          const { worktreePath, directories } = parseMoveRequest(body);
+          return { ...(await workspace.move(worktreePath, directories)), mutationToken };
+        }),
+      },
     },
+    fetch: () => new Response("Not found", { status: 404 }),
   });
   return { url: `http://127.0.0.1:${server.port}`, stop: () => server.stop(true) };
 }

@@ -9,10 +9,15 @@
     "start": "bun run src/cli.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "build": "bun build src/cli.ts --target=bun --outdir=build",
-    "check": "bun run typecheck && bun test && bun run build"
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "build": "bun build src/cli.ts --compile --minify --outfile build/worktree-diet",
+    "check": "bun run lint && bun run typecheck && bun test && bun run build && bun run smoke",
+    "smoke": "bun scripts/smoke-build.ts"
   },
   "devDependencies": {
+    "@biomejs/biome": "2",
+    "@happy-dom/global-registrator": "^21.0.1",
     "@types/bun": "latest",
     "typescript": "latest"
   }

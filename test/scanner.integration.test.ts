@@ -300,6 +300,50 @@ describe("workspace scanner", () => {
     ]);
     expect(await Bun.file(join(root, "node_modules", "file")).text()).toBe("node_modules");
   });
+  test("never offers a generated folder that holds an independent repository", async () => {
+    const { root } = await makeRepository();
+    const experiment = join(root, "build", "experiment");
+    await mkdir(experiment, { recursive: true });
+    await git(experiment, "init");
+    await writeFile(join(experiment, "notes.txt"), "uncommitted");
+    await writeFile(join(root, "build", "output.js"), "x".repeat(1000));
+    const report = await scanRepository(root);
+    const main = report.worktrees.find((worktree) => worktree.path === report.repositories[0]?.path);
+    expect(main?.generatedDirectories.map((directory) => directory.name)).not.toContain("build");
+    // Its bytes count as source, so the totals match what the move would actually free.
+    expect(main?.generatedBytes).toBe(0);
+    expect(main?.sizes.sourceOther).toBeGreaterThanOrEqual(1000);
+    expect(
+      report.warnings.some(
+        (warning) => warning.path.endsWith("/build") && warning.message.includes("contains a Git repository"),
+      ),
+    ).toBe(true);
+  });
+  test("refuses to move a folder that gained a repository or worktree after the scan", async () => {
+    const { root } = await makeRepository();
+    for (const name of ["dist", "node_modules"]) {
+      await mkdir(join(root, name, "nested"), { recursive: true });
+      await writeFile(join(root, name, "nested", "file.js"), name);
+    }
+    const report = await scanRepository(root);
+    expect(report.worktrees.flatMap((worktree) => worktree.generatedDirectories.map((d) => d.name)).sort()).toEqual([
+      "dist",
+      "node_modules",
+    ]);
+    // After the scan: a linked worktree appears inside dist, and an independent repository inside node_modules.
+    await git(root, "worktree", "add", "-b", "late", join(root, "dist", "late"));
+    await writeFile(join(root, "dist", "late", "work.txt"), "uncommitted");
+    await git(join(root, "node_modules", "nested"), "init");
+    const trashRoot = await temporaryDirectory("worktree-diet-trash-");
+    const result = await moveGeneratedDirectories(report, root, { trashRoot });
+    expect(result.moved).toEqual([]);
+    expect(result.warnings.map((warning) => warning.message.includes("contains a Git repository"))).toEqual([
+      true,
+      true,
+    ]);
+    expect(await Bun.file(join(root, "dist", "late", "work.txt")).text()).toBe("uncommitted");
+    expect(await Bun.file(join(root, "node_modules", "nested", "file.js")).text()).toBe("node_modules");
+  });
   test("returns a useful error for non-Git input", async () => {
     const path = await temporaryDirectory("worktree-diet-not-git-");
     await expect(scanRepository(path)).rejects.toThrow("Not a Git repository");

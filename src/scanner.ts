@@ -270,6 +270,8 @@ class HardlinkLedger {
 
 interface Measurement extends Tally {
   generatedDirectories: GeneratedDirectory[];
+  /** Generated folders holding a Git repository or worktree (the path of the first one found). */
+  blocked: Map<GeneratedDirectory, string>;
   warnings: ScanWarning[];
 }
 async function measureWorktree(
@@ -280,6 +282,7 @@ async function measureWorktree(
 ): Promise<Measurement> {
   const tally: Tally = { logical: emptySizes(), allocated: emptySizes() };
   const generatedDirectories: GeneratedDirectory[] = [];
+  const blocked = new Map<GeneratedDirectory, string>();
   const warnings: ScanWarning[] = [];
 
   const visit = async (directory: string, category: Category, generated?: GeneratedDirectory): Promise<void> => {
@@ -293,13 +296,20 @@ async function measureWorktree(
     await Promise.all(
       entries.map(async (entry) => {
         const path = join(directory, entry.name);
+        if (entry.name === ".git") {
+          // A repository or linked worktree lives here. Moving a generated folder around it would carry
+          // that repository, and its uncommitted work, into Trash.
+          const first = generated && blocked.get(generated);
+          if (generated && (!first || directory < first)) blocked.set(generated, directory);
+          return;
+        }
         if (entry.isSymbolicLink()) {
           // Links inside generated folders are routine (node_modules/.bin); only note ones in source.
           if (category === "sourceOther") warnings.push({ path, message: "Skipped symbolic link" });
           return;
         }
         if (entry.isDirectory()) {
-          if (entry.name === ".git" || excludedRoots.has(path)) return;
+          if (excludedRoots.has(path)) return;
           let childCategory = category === "sourceOther" ? generatedCategory(entry.name) : category;
           const nested =
             category === "sourceOther" && childCategory !== "sourceOther"
@@ -351,7 +361,7 @@ async function measureWorktree(
   // The walk is parallel, so order its results by path to keep reports stable.
   generatedDirectories.sort((left, right) => left.path.localeCompare(right.path));
   warnings.sort((left, right) => left.path.localeCompare(right.path));
-  return { ...tally, generatedDirectories, warnings };
+  return { ...tally, generatedDirectories, blocked, warnings };
 }
 
 async function repositoryIdentity(path: string, git: Limit): Promise<Repository | { error: string }> {
@@ -458,6 +468,18 @@ interface PendingWorktree {
 async function finishWorktree(pending: PendingWorktree): Promise<WorktreeRecord> {
   const [measured, status, lastCommit] = await Promise.all([pending.measurement, pending.status, pending.lastCommit]);
   const warnings = [...measured.warnings];
+  // Runs after hardlinks are settled, so every byte of a blocked folder is final before it becomes source.
+  for (const [folder, repository] of measured.blocked) {
+    measured.logical[folder.category] -= folder.logicalBytes;
+    measured.logical.sourceOther += folder.logicalBytes;
+    measured.allocated[folder.category] -= folder.allocatedBytes;
+    measured.allocated.sourceOther += folder.allocatedBytes;
+    warnings.push({
+      path: folder.path,
+      message: `Not treated as generated because it contains a Git repository or worktree at ${repository}`,
+    });
+  }
+  const generatedDirectories = measured.generatedDirectories.filter((folder) => !measured.blocked.has(folder));
   if (!status.ok) warnings.push({ path: pending.path, message: `Could not read Git status: ${status.error}` });
   if (!lastCommit.ok) warnings.push({ path: pending.path, message: `Could not read last commit: ${lastCommit.error}` });
   const commitSeconds = lastCommit.ok ? lastCommit.output.trim() : "";
@@ -474,7 +496,7 @@ async function finishWorktree(pending: PendingWorktree): Promise<WorktreeRecord>
     allocatedBytes: totalSizes(measured.allocated),
     generatedBytes: generatedTotal(measured.logical),
     generatedAllocatedBytes: generatedTotal(measured.allocated),
-    generatedDirectories: measured.generatedDirectories,
+    generatedDirectories,
     warnings,
   };
   return { ...base, activity: activityFor(base) };
@@ -595,10 +617,40 @@ export function foldersToMove(
 }
 
 /**
+ * The first directory under `folder` that holds a `.git` (a repository or linked worktree), checked by
+ * name only so it stays quick even for a large node_modules. Throws if part of the folder can't be read,
+ * since then it can't be shown to be safe to move.
+ */
+async function findRepositoryInside(folder: string): Promise<string | undefined> {
+  const io = concurrencyLimit(FILESYSTEM_CONCURRENCY);
+  let found: string | undefined;
+  const visit = async (directory: string): Promise<void> => {
+    if (found) return;
+    let entries: Dirent[];
+    try {
+      entries = await io(() => readdir(directory, { withFileTypes: true }));
+    } catch (error) {
+      throw new Error(`Could not check ${directory} for repositories: ${errorMessage(error)}`);
+    }
+    if (entries.some((entry) => entry.name === ".git")) {
+      found ??= directory;
+      return;
+    }
+    await Promise.all(
+      entries
+        .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+        .map((entry) => visit(join(directory, entry.name))),
+    );
+  };
+  await visit(folder);
+  return found;
+}
+
+/**
  * Moves the generated folders the latest scan found in one worktree into a fresh Trash folder.
- * Paths come only from the report, and each is re-checked first: inside the worktree, holding no other
- * worktree, still a real directory, and still at the same canonical path, so a parent swapped for a
- * symlink since the scan can't redirect the move elsewhere.
+ * Paths come only from the report, and each is re-checked first: inside the worktree, still a real
+ * directory, still at the same canonical path (so a parent swapped for a symlink since the scan can't
+ * redirect the move), and holding no Git repository or worktree, including ones created since the scan.
  */
 export async function moveGeneratedDirectories(
   report: ScanReport,
@@ -642,6 +694,11 @@ export async function moveGeneratedDirectories(
       }
       if ((await realpath(directory.path)) !== directory.path) {
         skip(directory.path, "Skipped because its location changed since the scan");
+        continue;
+      }
+      const repository = await findRepositoryInside(directory.path);
+      if (repository) {
+        skip(directory.path, `Skipped because it contains a Git repository or worktree at ${repository}`);
         continue;
       }
       if (!trashReady) {
